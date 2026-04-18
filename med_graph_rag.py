@@ -2,344 +2,27 @@
 MedGraphRAG — Triple Graph Construction + U-Retrieval
 Based on: "Medical Graph RAG: Towards Safe Medical Large Language Model
            via Graph Retrieval-Augmented Generation" (Wu et al., 2024)
-
-Architecture
-------------
-Layer 1  (RAG Graph / Meta-MedGraph Gm)
-  Raw user documents → semantic chunks → entity extraction → relationship linking
-  Each entity:  {name, type (UMLS semantic type), context}
-
-Layer 2  (Repository Graph – Med Papers/Books)
-  Medical reference texts → same entity+relationship extraction
-  Linked to Layer-1 entities via cosine-similarity ("the_reference_of")
-
-Layer 3  (Repository Graph – Medical Vocabularies / UMLS-style)
-  Hardcoded controlled-vocabulary entries (UMLS concepts)
-  Linked to Layer-2 entities via cosine-similarity ("the_definition_of")
-  Each entity also carries a formal definition string
-
-Retrieval: U-Retrieval
-  Top-down: generate tags for query → match tags layer-by-layer to find target
-            Meta-MedGraph Gmt
-  Bottom-up: fetch top-N entities + triple-neighbours from Gmt, generate
-             initial response, then refine upward through higher tag layers
 """
 
 from __future__ import annotations
-
-import json
-import os
-import re
-import textwrap
-from dataclasses import dataclass, field
 from typing import Optional
-
 import networkx as nx
 import numpy as np
+
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from scipy.spatial.distance import cosine
 
-
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
-UMLS_SEMANTIC_TYPES = [
-    "Disease", "Finding", "Pharmacologic Substance", "Clinical Drug",
-    "Therapeutic or Preventive Procedure", "Diagnostic Procedure",
-    "Body Part, Organ, or Organ Component", "Pathologic Function",
-    "Sign or Symptom", "Organism", "Anatomy", "Hormone",
-    "Biologically Active Substance", "Cell", "Gene or Genome",
-    "Injury or Poisoning", "Mental or Behavioral Dysfunction",
-    "Neoplastic Process", "Virus", "Bacterium", "Other",
-]
-
-MEDICAL_TAGS = [
-    "SYMPTOMS", "PATIENT_HISTORY", "BODY_FUNCTION", "MEDICATION",
-    "DIAGNOSIS", "PROCEDURE", "LAB_RESULTS", "PROGNOSIS",
-    "RISK_FACTORS", "TREATMENT_PLAN",
-]
-
-# Minimal built-in vocabulary (stands in for UMLS graph, Layer 3)
-BUILTIN_VOCAB: list[dict] = [
-    {"name": "Hypertension", "type": "Disease",
-     "definition": "Persistently elevated arterial blood pressure (≥130/80 mmHg)."},
-    {"name": "Myocardial Infarction", "type": "Disease",
-     "definition": "Irreversible necrosis of heart muscle secondary to ischaemia."},
-    {"name": "Beta-blocker", "type": "Pharmacologic Substance",
-     "definition": "Drug class that blocks β-adrenergic receptors, reducing heart rate and BP."},
-    {"name": "ACE Inhibitor", "type": "Pharmacologic Substance",
-     "definition": "Inhibits angiotensin-converting enzyme, used for HTN and heart failure."},
-    {"name": "Metformin", "type": "Clinical Drug",
-     "definition": "First-line oral biguanide for type-2 diabetes; reduces hepatic glucose output."},
-    {"name": "Type 2 Diabetes Mellitus", "type": "Disease",
-     "definition": "Chronic metabolic disorder characterised by insulin resistance and hyperglycaemia."},
-    {"name": "COPD", "type": "Disease",
-     "definition": "Chronic obstructive pulmonary disease; persistent airflow limitation."},
-    {"name": "Bronchodilator", "type": "Pharmacologic Substance",
-     "definition": "Agent that relaxes bronchial smooth muscle to widen airways."},
-    {"name": "Heart Failure", "type": "Disease",
-     "definition": "Inability of the heart to pump sufficient blood to meet the body's needs."},
-    {"name": "Atrial Fibrillation", "type": "Disease",
-     "definition": "Irregular rapid atrial rhythm causing ineffective atrial contraction."},
-    {"name": "Statin", "type": "Pharmacologic Substance",
-     "definition": "HMG-CoA reductase inhibitor that reduces LDL cholesterol levels."},
-    {"name": "Sepsis", "type": "Disease",
-     "definition": "Life-threatening organ dysfunction caused by dysregulated host response to infection."},
-    {"name": "Pneumonia", "type": "Disease",
-     "definition": "Infection causing inflammation of alveoli, often with consolidation."},
-    {"name": "Echocardiography", "type": "Diagnostic Procedure",
-     "definition": "Ultrasound imaging of cardiac structure and function."},
-    {"name": "Creatinine", "type": "Biologically Active Substance",
-     "definition": "Serum marker of renal filtration; elevated in kidney disease."},
-]
-
-
-@dataclass
-class Entity:
-    name: str
-    entity_type: str      # UMLS semantic type
-    context: str          # A few sentences of contextual description
-    definition: str = ""  # Used in Layer-3 only
-    layer: int = 1        # 1 = RAG, 2 = Med Papers, 3 = Vocabulary
-    embedding: Optional[np.ndarray] = field(default=None, repr=False)
-
-    @property
-    def content_text(self) -> str:
-        return f"name: {self.name}; type: {self.entity_type}; context: {self.context}"
-
-
-@dataclass
-class Relationship:
-    source: str   # entity name
-    relation: str
-    target: str   # entity name
-
-
-@dataclass
-class MetaMedGraph:
-    """A graph built from one semantic chunk (or a merged cluster of chunks)."""
-    graph_id: str
-    entities: list[Entity] = field(default_factory=list)
-    relationships: list[Relationship] = field(default_factory=list)
-    tag_summary: dict[str, str] = field(default_factory=dict)   # tag → description
-    source_text: str = ""
-
-    def entity_names(self) -> list[str]:
-        return [e.name for e in self.entities]
-
-
-# ---------------------------------------------------------------------------
-# Embedding helper
-# ---------------------------------------------------------------------------
-
-class EmbeddingStore:
-    def __init__(self, embedder: OpenAIEmbeddings):
-        self._emb = embedder
-        self._cache: dict[str, np.ndarray] = {}
-
-    def embed(self, text: str) -> np.ndarray:
-        if text not in self._cache:
-            vec = self._emb.embed_query(text)
-            self._cache[text] = np.array(vec, dtype=np.float32)
-        return self._cache[text]
-
-    def similarity(self, a: str | np.ndarray, b: str | np.ndarray) -> float:
-        va = a if isinstance(a, np.ndarray) else self.embed(a)
-        vb = b if isinstance(b, np.ndarray) else self.embed(b)
-        if np.linalg.norm(va) == 0 or np.linalg.norm(vb) == 0:
-            return 0.0
-        return float(1.0 - cosine(va, vb))
-
-
-# ---------------------------------------------------------------------------
-# LLM-powered helpers
-# ---------------------------------------------------------------------------
-
-def _call_llm_json(llm: ChatOpenAI, prompt: str) -> dict | list:
-    """Call LLM and parse JSON from the response."""
-    resp = llm.invoke(prompt)
-    raw = resp.content.strip()
-    # strip markdown fences
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # try to extract first JSON object/array
-        m = re.search(r"(\{.*\}|\[.*\])", raw, re.DOTALL)
-        if m:
-            return json.loads(m.group(1))
-        return {}
-
-
-def _extract_entities(llm: ChatOpenAI, chunk_text: str) -> list[Entity]:
-    semantic_types_str = ", ".join(UMLS_SEMANTIC_TYPES)
-    prompt = textwrap.dedent(f"""
-        You are a biomedical NLP expert. Extract all medically relevant entities from the text below.
-
-        For each entity return a JSON object with keys:
-          - "name": the entity name (string)
-          - "type": one of [{semantic_types_str}]
-          - "context": 1-2 sentence contextual description based on the text
-
-        Return ONLY a JSON array of these objects, nothing else. No markdown, no explanation.
-
-        TEXT:
-        {chunk_text}
-    """).strip()
-    result = _call_llm_json(llm, prompt)
-    entities = []
-    if isinstance(result, list):
-        for item in result:
-            if isinstance(item, dict) and "name" in item:
-                entities.append(Entity(
-                    name=item.get("name", "Unknown"),
-                    entity_type=item.get("type", "Other"),
-                    context=item.get("context", ""),
-                    layer=1,
-                ))
-    return entities
-
-
-def _extract_relationships(
-    llm: ChatOpenAI, chunk_text: str, entities: list[Entity]
-) -> list[Relationship]:
-    entity_names = [e.name for e in entities]
-    if len(entity_names) < 2:
-        return []
-    prompt = textwrap.dedent(f"""
-        You are a biomedical knowledge graph expert.
-        Given the entities: {entity_names}
-        And the source text below, identify meaningful relationships BETWEEN those entities.
-
-        Return ONLY a JSON array where each element has:
-          - "source": name of source entity (must be from the list above)
-          - "relation": a short relation phrase (e.g. "treats", "causes", "is_symptom_of")
-          - "target": name of target entity (must be from the list above)
-
-        Only include relationships explicitly or strongly implied by the text.
-        Return ONLY the JSON array, no markdown, no explanation.
-
-        TEXT:
-        {chunk_text}
-    """).strip()
-    result = _call_llm_json(llm, prompt)
-    rels = []
-    if isinstance(result, list):
-        for item in result:
-            if isinstance(item, dict) and "source" in item and "target" in item:
-                rels.append(Relationship(
-                    source=item.get("source", ""),
-                    relation=item.get("relation", "related_to"),
-                    target=item.get("target", ""),
-                ))
-    return rels
-
-
-def _tag_graph(llm: ChatOpenAI, graph: MetaMedGraph) -> dict[str, str]:
-    entity_texts = "\n".join(
-        f"- {e.name} ({e.entity_type}): {e.context}" for e in graph.entities
-    )
-    tags_str = ", ".join(MEDICAL_TAGS)
-    prompt = textwrap.dedent(f"""
-        You are a medical text summarizer. Summarize the following medical entities using
-        these structured tag categories: {tags_str}
-
-        For each relevant tag, provide a short phrase describing what is present.
-        Return ONLY a JSON object where keys are tag names and values are short descriptions.
-        Omit tags that are not relevant. No markdown, no explanation.
-
-        ENTITIES:
-        {entity_texts}
-    """).strip()
-    result = _call_llm_json(llm, prompt)
-    if isinstance(result, dict):
-        return {k: str(v) for k, v in result.items()}
-    return {}
-
-
-def _generate_answer(
-    llm: ChatOpenAI,
-    question: str,
-    graph: MetaMedGraph,
-    top_entities: list[Entity],
-    top_k_neighbors: list[Entity],
-) -> str:
-    graph_text = ""
-    all_ents = {e.name: e for e in top_entities + top_k_neighbors}
-    for rel in graph.relationships:
-        if rel.source in all_ents or rel.target in all_ents:
-            src_e = all_ents.get(rel.source)
-            tgt_e = all_ents.get(rel.target)
-            src_ctx = f" [{src_e.context[:80]}]" if src_e else ""
-            tgt_ctx = f" [{tgt_e.context[:80]}]" if tgt_e else ""
-            # Include definitions and sources from layers 2 & 3
-            src_def = ""
-            tgt_def = ""
-            if src_e and src_e.layer == 3:
-                src_def = f" (Definition: {src_e.definition})"
-            if tgt_e and tgt_e.layer == 3:
-                tgt_def = f" (Definition: {tgt_e.definition})"
-            graph_text += (
-                f"{rel.source}{src_ctx}{src_def} "
-                f"--[{rel.relation}]--> "
-                f"{rel.target}{tgt_ctx}{tgt_def}\n"
-            )
-
-    entity_detail = "\n".join(
-        f"• {e.name} ({e.entity_type}, Layer {e.layer}): {e.context}"
-        + (f"\n  Source/Definition: {e.definition}" if e.definition else "")
-        for e in (top_entities + top_k_neighbors)
-    )
-
-    prompt = textwrap.dedent(f"""
-        You are a medical expert assistant generating evidence-based responses.
-
-        QUESTION: {question}
-
-        RELEVANT ENTITIES (with source and definition references):
-        {entity_detail}
-
-        GRAPH RELATIONSHIPS:
-        {graph_text if graph_text else "(no direct relationships found)"}
-
-        Using the entities and graph above, answer the question in detail.
-        Cite specific entities by name. If definitions are provided use them to
-        clarify terminology. Be precise and evidence-based.
-    """).strip()
-    resp = llm.invoke(prompt)
-    return resp.content.strip()
-
-
-def _refine_answer(
-    llm: ChatOpenAI, question: str, prev_response: str, summary: dict[str, str]
-) -> str:
-    summary_text = "\n".join(f"  {k}: {v}" for k, v in summary.items())
-    prompt = textwrap.dedent(f"""
-        You are a medical expert assistant. Refine the response below using the
-        higher-level summary context provided.
-
-        QUESTION: {question}
-
-        PREVIOUS RESPONSE:
-        {prev_response}
-
-        ADDITIONAL CONTEXT (higher-level summary):
-        {summary_text}
-
-        Adjust and improve the response, ensuring completeness and accuracy.
-        Preserve all cited evidence from the previous response and add any new
-        relevant information from the additional context.
-    """).strip()
-    resp = llm.invoke(prompt)
-    return resp.content.strip()
-
-
-# ---------------------------------------------------------------------------
-# Core MedGraphRAG system
-# ---------------------------------------------------------------------------
+from data_models import Entity, Relationship, MetaMedGraph, MEDICAL_TAGS, BUILTIN_VOCAB
+from api_clients import UMLSClient, Neo4jClient
+from llm_helpers import (
+    EmbeddingStore, 
+    _call_llm_json, 
+    _extract_entities, 
+    _extract_relationships, 
+    _tag_graph, 
+    _generate_answer, 
+    _refine_answer
+)
 
 class MedGraphRAG:
     """
@@ -360,9 +43,25 @@ class MedGraphRAG:
     TOP_K_NEIGHBOURS     = 2      # ku  — triple-neighbour hops
     MAX_TAG_LAYERS       = 6      # max U-Retrieval layers
 
-    def __init__(self, llm: ChatOpenAI, embedder: OpenAIEmbeddings):
+    def __init__(
+        self, 
+        llm: ChatOpenAI, 
+        embedder: OpenAIEmbeddings, 
+        umls_api_key: Optional[str] = None,
+        neo4j_creds: Optional[dict] = None,
+    ):
         self.llm = llm
         self.emb = EmbeddingStore(embedder)
+        self.umls = UMLSClient(api_key=umls_api_key)
+        
+        # Neo4j setup
+        self.neo4j = None
+        if neo4j_creds:
+            self.neo4j = Neo4jClient(
+                uri=neo4j_creds.get("uri"),
+                user=neo4j_creds.get("user"),
+                password=neo4j_creds.get("password")
+            )
 
         # Layer 1 – user RAG graphs
         self.meta_graphs: list[MetaMedGraph] = []
@@ -370,8 +69,12 @@ class MedGraphRAG:
         # Layer 2 – repository (paper) entities
         self.repo_entities_l2: list[Entity] = []
 
-        # Layer 3 – vocabulary entities  (pre-seeded from BUILTIN_VOCAB)
+        # Layer 3 – vocabulary entities (pre-seeded with BUILTIN_VOCAB to act as a constant layout)
         self.repo_entities_l3: list[Entity] = self._build_vocab_layer()
+        
+        # Initial sync of vocab to Neo4j
+        if self.neo4j:
+            self.neo4j.sync_entities(self.repo_entities_l3)
 
         # Hierarchical tag tree  [{graph_id: str, tags: dict, children: list}]
         self.tag_tree: list[dict] = []
@@ -380,7 +83,7 @@ class MedGraphRAG:
         self.nx_graph = nx.DiGraph()
 
     # ------------------------------------------------------------------
-    # Layer 3 – Vocabulary (UMLS-style), built once
+    # Layer 3 – Vocabulary (UMLS-style) constant layer initialization
     # ------------------------------------------------------------------
 
     def _build_vocab_layer(self) -> list[Entity]:
@@ -395,6 +98,54 @@ class MedGraphRAG:
             )
             entities.append(e)
         return entities
+
+    def bulk_seed_vocabulary(self, terms: list[str], progress_callback=None):
+        """
+        Seed Layer 3 with a specific list of medical terms.
+        Falls back to BUILTIN_VOCAB if UMLS fails.
+        """
+        total = len(terms)
+        for i, term in enumerate(terms):
+            # Duplicate check
+            if any(v.name.lower() == term.lower() for v in self.repo_entities_l3):
+                if progress_callback:
+                    progress_callback(i + 1, total, f"⏩ Skipping (exists): {term}")
+                continue
+
+            details = None
+            if self.umls.api_key:
+                if progress_callback:
+                    progress_callback(i + 1, total, f"🔍 UMLS Seeding: {term}")
+                details = self.umls.get_term_details(term)
+            
+            if details:
+                u_ent = Entity(
+                    name=details["name"],
+                    entity_type=details["type"],
+                    context=details["definition"] or f"UMLS Concept: {details['name']}",
+                    definition=details["definition"],
+                    layer=3,
+                )
+                self.repo_entities_l3.append(u_ent)
+                if self.neo4j:
+                    self.neo4j.sync_entities([u_ent])
+            else:
+                # Fallback to BUILTIN_VOCAB
+                for vocab in BUILTIN_VOCAB:
+                    if vocab["name"].lower() == term.lower():
+                        if progress_callback:
+                            progress_callback(i + 1, total, f"🔍 BUILTIN fallback: {term}")
+                        u_ent = Entity(
+                            name=vocab["name"],
+                            entity_type=vocab["type"],
+                            context=vocab["definition"],
+                            definition=vocab["definition"],
+                            layer=3,
+                        )
+                        self.repo_entities_l3.append(u_ent)
+                        if self.neo4j:
+                            self.neo4j.sync_entities([u_ent])
+                        break
 
     # ------------------------------------------------------------------
     # Step 1 – Semantic document chunking
@@ -462,6 +213,8 @@ class MedGraphRAG:
                             relation="the_reference_of",
                             similarity=sim,
                         )
+                        if self.neo4j:
+                            self.neo4j.add_cross_layer_edge(e1.name, e2.name, "the_reference_of", sim)
 
         # L2 → L3
         for e2 in self.repo_entities_l2:
@@ -477,6 +230,8 @@ class MedGraphRAG:
                         relation="the_definition_of",
                         similarity=sim,
                     )
+                    if self.neo4j:
+                        self.neo4j.add_cross_layer_edge(e2.name, e3.name, "the_definition_of", sim)
 
         # Also directly link L1 → L3 when there is no L2 (fallback)
         for mg in self.meta_graphs:
@@ -495,6 +250,8 @@ class MedGraphRAG:
                             relation="the_definition_of",
                             similarity=sim,
                         )
+                        if self.neo4j:
+                            self.neo4j.add_cross_layer_edge(e1.name, e3.name, "the_definition_of", sim)
 
     # ------------------------------------------------------------------
     # Step 5 – Tag the graphs  (hierarchical clustering)
@@ -717,12 +474,26 @@ class MedGraphRAG:
 
         Returns a summary of what was built.
         """
+        # --- Selective clearing ---
         self.meta_graphs.clear()
         self.repo_entities_l2.clear()
-        self.nx_graph.clear()
         self.tag_tree.clear()
-        # Rebuild L3 (always fresh from vocab)
-        self.repo_entities_l3 = self._build_vocab_layer()
+
+        # Remove only L1 and L2 nodes from NetworkX
+        nodes_to_remove = [
+            n for n, d in self.nx_graph.nodes(data=True)
+            if d.get("entity") and d.get("entity").layer in [1, 2]
+        ]
+        self.nx_graph.remove_nodes_from(nodes_to_remove)
+
+        if self.neo4j:
+            self.neo4j.clear_db()
+
+        # We NO LONGER rebuild L3 here; it persists.
+        # But we ensure L3 nodes are in nx_graph for linking
+        for e3 in self.repo_entities_l3:
+            if not self.nx_graph.has_node(e3.name):
+                self.nx_graph.add_node(e3.name, entity=e3)
 
         def _progress(msg: str):
             if progress_callback:
@@ -737,6 +508,13 @@ class MedGraphRAG:
             gid = f"chunk_{i}"
             mg = self._build_meta_graph(chunk, gid)
             self.meta_graphs.append(mg)
+            
+            # Sync L1 to Neo4j
+            if self.neo4j:
+                self.neo4j.sync_entities(mg.entities)
+                self.neo4j.sync_relationships(mg.relationships)
+            
+
 
         # --- Layer 2: Medical paper entities (if provided) ---
         if paper_texts:
@@ -747,6 +525,12 @@ class MedGraphRAG:
                     e.layer = 2
                     e.embedding = self.emb.embed(e.content_text)
                 self.repo_entities_l2.extend(paper_entities)
+                
+                # Sync L2 to Neo4j
+                if self.neo4j:
+                    self.neo4j.sync_entities(paper_entities)
+                
+
 
         # --- Layer 3 already built (BUILTIN_VOCAB) ---
         _progress("⚙️  Embedding Layer-3 vocabulary entities…")
@@ -796,3 +580,100 @@ class MedGraphRAG:
             "total_nodes": self.nx_graph.number_of_nodes(),
             "total_edges": self.nx_graph.number_of_edges(),
         }
+
+    def clear_all(self):
+        """
+        Clears all graph data globally from memory and Neo4j.
+        """
+        self.meta_graphs.clear()
+        self.repo_entities_l2.clear()
+        self.repo_entities_l3.clear()
+        self.tag_tree.clear()
+        self.nx_graph.clear()
+        if self.neo4j:
+            self.neo4j.clear_all_db()
+
+    def clear_all_relationships(self):
+        """
+        Clears all relationships (edges) from memory and Neo4j, but retains nodes.
+        """
+        self.nx_graph.clear_edges()
+        if self.neo4j:
+            self.neo4j.clear_all_relationships()
+
+    def simulate_massive_vocab(self, num_nodes=500000, batch_size=10000, progress_callback=None):
+        """
+        Injects a massive set of dummy nodes into Layer 3 to simulate high capacity.
+        Processed in batches to avoid OOM in python list and Neo4j.
+        Computes Hugging Face embeddings in batches if configured.
+        """
+        self.clear_all()
+        
+        total_batches = (num_nodes // batch_size) + (1 if num_nodes % batch_size else 0)
+        
+        for batch_i in range(total_batches):
+            if progress_callback:
+                progress_callback(batch_i + 1, total_batches, f"Injecting batch {batch_i + 1}/{total_batches} ({num_nodes} nodes total) into L3")
+            
+            start_i = len(self.repo_entities_l3)
+            end_i = min(start_i + batch_size, num_nodes)
+            
+            if start_i >= num_nodes:
+                break
+                
+            batch_entities = []
+            for i in range(start_i, end_i):
+                e = Entity(
+                    name=f"SimNode_{i}",
+                    entity_type="Simulated",
+                    context=f"Simulated entity {i} for stress test",
+                    definition=f"Definition of simulated entity {i}",
+                    layer=3
+                )
+                batch_entities.append(e)
+            
+            # Embed batch
+            texts = [e.content_text for e in batch_entities]
+            try:
+                embeddings = self.emb.embed_batch(texts)
+                for e, vec in zip(batch_entities, embeddings):
+                    e.embedding = vec
+            except Exception as e:
+                print(f"Embedding batch failed: {e}")
+            
+            self.repo_entities_l3.extend(batch_entities)
+            
+            if self.neo4j:
+                self.neo4j.sync_entities(batch_entities)
+                # Ensure we add mock relationships sequentially so the graph structure exists.
+                # E.g., SimNode_i -> SimNode_i+1
+                rels = []
+                for i in range(len(batch_entities) - 1):
+                    rels.append(Relationship(
+                        source=batch_entities[i].name,
+                        target=batch_entities[i+1].name,
+                        relation="SIMULATED_LINK"
+                    ))
+                self.neo4j.sync_relationships(rels)
+
+    def import_local_umls_relationships_dump(self, mrconso_path: str, mrrel_path: str, progress_callback=None):
+        from umls_importer import load_umls_relationships_to_neo4j
+        if not self.neo4j_creds:
+            raise ValueError("Neo4j credentials are required to import UMLS dump.")
+            
+        uri = self.neo4j_creds.get("uri")
+        user = self.neo4j_creds.get("user")
+        pwd = self.neo4j_creds.get("password")
+        
+        return load_umls_relationships_to_neo4j(mrconso_path, mrrel_path, uri, user, pwd, progress_callback)
+
+    def import_local_umls_dump(self, mrconso_path: str, mrsty_path: str, progress_callback=None):
+        from umls_importer import load_umls_to_neo4j
+        if not self.neo4j_creds:
+            raise ValueError("Neo4j credentials are required to import UMLS dump.")
+            
+        uri = self.neo4j_creds.get("uri")
+        user = self.neo4j_creds.get("user")
+        pwd = self.neo4j_creds.get("password")
+        
+        return load_umls_to_neo4j(mrconso_path, mrsty_path, uri, user, pwd, progress_callback)

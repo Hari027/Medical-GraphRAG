@@ -1,14 +1,16 @@
-"""
-MedGraphRAG – Streamlit Interface
-Implements the triple-layer graph from Wu et al. (2024)
-"""
-
 import os
+from dotenv import load_dotenv
+load_dotenv()
+os.environ["USER_AGENT"] = "MedGraphRAG/1.0"
+
 import json
 import streamlit as st
-from dotenv import load_dotenv
+import streamlit.components.v1 as components
+from pyvis.network import Network
+from medical_terms import get_medical_terms
 from langchain_community.document_loaders import WebBaseLoader
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_huggingface import HuggingFaceEmbeddings
 
 from med_graph_rag import MedGraphRAG, MEDICAL_TAGS
 
@@ -141,6 +143,14 @@ h1, h2, h3 {
     margin: 8px 0;
     background: #0d1117;
 }
+.neo4j-status {
+    padding: 5px 10px;
+    border-radius: 5px;
+    font-size: 0.8em;
+    margin-bottom: 10px;
+}
+.status-online { background: #1a7f37; color: white; }
+.status-offline { background: #cf222e; color: white; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -148,8 +158,11 @@ h1, h2, h3 {
 # Init
 # -------------------------------------------------------------------------
 
-load_dotenv()
 api_key = os.environ.get("OPENAI_API_KEY")
+umls_api_key = os.environ.get("UMLS_API_KEY")
+neo4j_uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
+neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
+neo4j_pass = os.environ.get("NEO4J_PASSWORD", "password")
 
 if not api_key:
     st.error("⚠️  Set OPENAI_API_KEY in your .env file.")
@@ -157,8 +170,18 @@ if not api_key:
 
 if "med_rag" not in st.session_state:
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
-    embedder = OpenAIEmbeddings(model="text-embedding-3-small")
-    st.session_state.med_rag = MedGraphRAG(llm=llm, embedder=embedder)
+    embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    neo4j_creds = {
+        "uri": neo4j_uri,
+        "user": neo4j_user,
+        "password": neo4j_pass
+    }
+    st.session_state.med_rag = MedGraphRAG(
+        llm=llm, 
+        embedder=embedder, 
+        umls_api_key=umls_api_key,
+        neo4j_creds=neo4j_creds
+    )
     st.session_state.build_stats = None
     st.session_state.last_result = None
     st.session_state.build_log = []
@@ -171,6 +194,14 @@ rag: MedGraphRAG = st.session_state.med_rag
 
 with st.sidebar:
     st.markdown("## 🧬 MedGraphRAG")
+    
+    # Neo4j Status
+    if st.session_state.med_rag.neo4j and st.session_state.med_rag.neo4j.driver:
+        st.markdown('<div class="neo4j-status status-online">🟢 Neo4j Connected</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="neo4j-status status-offline">🔴 Neo4j Disconnected</div>', unsafe_allow_html=True)
+        st.caption("Check .env or start Neo4j server.")
+
     st.caption("Triple Graph Construction + U-Retrieval")
 
     st.markdown("---")
@@ -199,23 +230,93 @@ with st.sidebar:
         )
 
     st.markdown("### 📚 Layer 2 – Medical Reference Texts *(optional)*")
-    paper_text = st.text_area(
+    paper_input = st.text_area(
         "Paste reference paper/book excerpt(s)",
         height=100,
         placeholder="Paste one or more relevant paper abstracts or textbook passages…",
     )
-    paper_texts = [paper_text.strip()] if paper_text.strip() else []
+    paper_texts = [p.strip() for p in paper_input.split("\n") if p.strip()]
 
-    st.markdown("### 📖 Layer 3 – Vocabulary")
-    st.caption("Built-in UMLS-style controlled vocabulary (always active)")
-    with st.expander("View vocabulary entries"):
-        from med_graph_rag import BUILTIN_VOCAB
-        for v in BUILTIN_VOCAB:
-            st.markdown(
-                f'<span class="entity-chip chip-l3">{v["name"]}</span> '
-                f'<small style="color:#8b949e">{v["type"]}</small>',
-                unsafe_allow_html=True,
-            )
+    st.markdown("---")
+    st.markdown(f"### 🗂️ Global Knowledge")
+    st.metric("Medical Vocabulary (L3)", len(st.session_state.med_rag.repo_entities_l3))
+    st.caption("This knowledge base persists across documents.")
+
+    seed_btn = st.button("🚀 Bulk Seed (Top 1000)", help="Fetches ~1000 medical concepts from UMLS (takes a few mins)")
+    if seed_btn:
+        terms = get_medical_terms()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        def update_progress(current, total, msg):
+            progress_bar.progress(current / total)
+            status_text.caption(msg)
+            
+        st.session_state.med_rag.bulk_seed_vocabulary(terms, progress_callback=update_progress)
+        st.success("✅ Seeding complete!")
+        st.rerun()
+
+    import_btn = st.button("📥 Load Local UMLS Nodes", help="Imports MRCONSO.RRF and MRSTY.RRF to build vocabulary nodes")
+    if import_btn:
+        import os
+        if not os.path.exists("MRCONSO.RRF") or not os.path.exists("MRSTY.RRF"):
+            st.error("❌ Could not find MRCONSO.RRF or MRSTY.RRF in the root directory.")
+        else:
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            
+            def update_import_progress(val, msg):
+                progress_bar.progress(val)
+                status_text.caption(msg)
+                
+            try:
+                st.session_state.med_rag.import_local_umls_dump(
+                    "MRCONSO.RRF", 
+                    "MRSTY.RRF", 
+                    progress_callback=update_import_progress
+                )
+                st.success("✅ Massive UMLS nodes injected!")
+            except Exception as e:
+                st.error(f"Import failed: {e}")
+            st.rerun()
+
+    rel_btn = st.button("🔗 Load Local UMLS Relationships", help="Imports MRREL.RRF to build ontology edges between existing nodes")
+    if rel_btn:
+        import os
+        if not os.path.exists("MRCONSO.RRF") or not os.path.exists("MRREL.RRF"):
+            st.error("❌ Could not find MRCONSO.RRF or MRREL.RRF in the root directory.")
+        else:
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            
+            def update_rel_progress(val, msg):
+                progress_bar.progress(val)
+                status_text.caption(msg)
+                
+            try:
+                st.session_state.med_rag.import_local_umls_relationships_dump(
+                    "MRCONSO.RRF", 
+                    "MRREL.RRF", 
+                    progress_callback=update_rel_progress
+                )
+                st.success("✅ Massive UMLS relationships injected!")
+            except Exception as e:
+                st.error(f"Import failed: {e}")
+            st.rerun()
+            st.rerun()
+        
+    clear_btn = st.button("🗑️ Clear Graph", help="Wipes all memory and detaches all Neo4j nodes")
+    if clear_btn:
+        st.session_state.med_rag.clear_all()
+        st.session_state.build_stats = None
+        st.success("✅ Graph completely cleared")
+        st.rerun()
+
+    clear_rel_btn = st.button("🗑️ Clear Relationships Only", help="Wipes all relationship edges but keeps the nodes intact")
+    if clear_rel_btn:
+        st.session_state.med_rag.clear_all_relationships()
+        st.success("✅ All relationships successfully cleared")
+        st.rerun()
 
     st.markdown("---")
     build_btn = st.button("🔨 Build Triple Graph", use_container_width=True)
@@ -327,7 +428,13 @@ with tab_query:
                     for e in res["triple_neighbours"]:
                         cls = "chip-l2" if e.layer == 2 else "chip-l3"
                         layer_cls = "layer-2" if e.layer == 2 else "layer-3"
+                        
+                        # Show UMLS source if available
                         label = "L2 Ref" if e.layer == 2 else "L3 Def"
+                        if e.layer == 3 and hasattr(e, 'definition') and e.definition:
+                            # A simple check for UMLS source (could be improved)
+                            label = "L3 UMLS" if len(e.definition) > 0 else "L3 Def"
+
                         defn = (
                             f'<br><small style="color:#f78166">Definition: {e.definition[:120]}</small>'
                             if e.definition else ""
@@ -389,6 +496,57 @@ with tab_query:
 # Tab 2 – Graph Explorer
 # ==============================
 
+def render_interactive_graph(nx_graph, layers_to_show):
+    net = Network(height="600px", width="100%", bgcolor="#0d1117", font_color="#e6edf3")
+    
+    # Node styles per layer
+    colors = {1: "#58a6ff", 2: "#3fb950", 3: "#f78166"}
+    
+    # Pre-select nodes to avoid showing orphaned L3 nodes
+    all_nodes = list(nx_graph.nodes(data=True))
+    relevant_l3 = set()
+    if 3 in layers_to_show:
+        # A Layer 3 node is relevant if it has an edge to/from a Layer 1 or Layer 2 node
+        for s, t, d in nx_graph.edges(data=True):
+            s_ent = nx_graph.nodes[s].get("entity")
+            t_ent = nx_graph.nodes[t].get("entity")
+            if s_ent and t_ent:
+                if s_ent.layer == 3 and t_ent.layer in [1, 2]: relevant_l3.add(s)
+                if t_ent.layer == 3 and s_ent.layer in [1, 2]: relevant_l3.add(t)
+
+    for n, data in all_nodes:
+        ent = data.get("entity")
+        if not ent: continue
+        
+        should_add = False
+        if ent.layer in [1, 2] and ent.layer in layers_to_show:
+            should_add = True
+        elif ent.layer == 3 and 3 in layers_to_show and n in relevant_l3:
+            should_add = True
+            
+        if should_add:
+            net.add_node(
+                n, 
+                label=n, 
+                title=f"{n} ({ent.entity_type})\n{ent.context[:100]}...",
+                color=colors.get(ent.layer, "#8b949e")
+            )
+            
+    for s, t, data in nx_graph.edges(data=True):
+        if s in net.get_nodes() and t in net.get_nodes():
+            net.add_edge(s, t, title=data.get("relation", ""))
+
+    # Physics for a nice feel
+    net.force_atlas_2based()
+    
+    # Save and read
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
+        net.save_graph(tmp.name)
+        with open(tmp.name, "r", encoding="utf-8") as f:
+            html = f.read()
+    return html
+
 with tab_graph:
     if not st.session_state.build_stats:
         st.info("Build the graph first.")
@@ -417,88 +575,112 @@ with tab_graph:
 
         st.markdown("---")
 
-        # Show each MetaMedGraph
-        for mg in rag.meta_graphs:
-            with st.expander(f"📊 {mg.graph_id}  ({len(mg.entities)} entities, {len(mg.relationships)} rels)"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("**Entities (Layer 1)**")
-                    for e in mg.entities:
-                        st.markdown(
-                            f'<span class="entity-chip chip-l1">{e.name}</span>'
-                            f'<small style="color:#8b949e"> {e.entity_type}</small>',
-                            unsafe_allow_html=True,
-                        )
-                    # Cross-layer neighbours
-                    nx_g = rag.nx_graph
-                    l2_links = [
-                        (v, d) for _, v, d in nx_g.out_edges(
-                            [e.name for e in mg.entities], data=True
-                        )
-                        if d.get("relation") == "the_reference_of"
-                    ]
-                    l3_links = [
-                        (v, d) for _, v, d in nx_g.out_edges(
-                            [e.name for e in mg.entities], data=True
-                        )
-                        if d.get("relation") == "the_definition_of"
-                    ]
-                    if l2_links:
-                        st.markdown("**→ Layer-2 References**")
-                        for tgt, d in l2_links[:6]:
-                            st.markdown(
-                                f'<span class="entity-chip chip-l2">{tgt}</span>'
-                                f'<small style="color:#8b949e"> sim={d.get("similarity", 0):.2f}</small>',
-                                unsafe_allow_html=True,
-                            )
-                    if l3_links:
-                        st.markdown("**→ Layer-3 Definitions**")
-                        for tgt, d in l3_links[:6]:
-                            st.markdown(
-                                f'<span class="entity-chip chip-l3">{tgt}</span>'
-                                f'<small style="color:#8b949e"> sim={d.get("similarity", 0):.2f}</small>',
-                                unsafe_allow_html=True,
-                            )
+        # View Mode Toggle
+        view_mode = st.radio("View Mode", ["Network Graph (Interactive)", "Entity Table"], horizontal=True)
 
-                with c2:
-                    st.markdown("**Relationships**")
-                    for r in mg.relationships:
-                        st.markdown(
-                            f'`{r.source}` '
-                            f'<span class="relation-badge">{r.relation}</span> '
-                            f'`{r.target}`',
-                            unsafe_allow_html=True,
-                        )
-                    st.markdown("**Tag Summary**")
-                    if mg.tag_summary:
-                        for k, v in mg.tag_summary.items():
-                            st.markdown(
-                                f'<span class="tag-pill">{k}</span> {v}',
-                                unsafe_allow_html=True,
-                            )
-
-        st.markdown("---")
-        st.markdown("### 🌲 Tag Tree (Hierarchical Clusters)")
-
-        def render_tree(nodes, depth=0):
-            for node in nodes:
-                indent = "&nbsp;" * (depth * 4)
-                ids_str = ", ".join(node["ids"])
-                tags_str = " ".join(
-                    f'<span class="tag-pill">{k}</span>'
-                    for k in node["tags"].keys()
-                )
-                st.markdown(
-                    f'{indent}📁 <b>{ids_str}</b> {tags_str}',
-                    unsafe_allow_html=True,
-                )
-                if node["children"]:
-                    render_tree(node["children"], depth + 1)
-
-        if rag.tag_tree:
-            render_tree(rag.tag_tree)
+        if view_mode == "Network Graph (Interactive)":
+            st.markdown("### 🕸️ Interactive Triple-Layer Graph")
+            st.caption("Drag nodes to explore, hover for details. Colors: 🔵 L1 🟢 L2 🔴 L3")
+            
+            col_f1, col_f2, col_f3 = st.columns(3)
+            with col_f1: show_l1 = st.checkbox("Show Layer 1 (User Docs)", value=True)
+            with col_f2: show_l2 = st.checkbox("Show Layer 2 (Med Papers)", value=True)
+            with col_f3: show_l3 = st.checkbox("Show Layer 3 (UMLS Vocab)", value=True)
+            
+            layers = []
+            if show_l1: layers.append(1)
+            if show_l2: layers.append(2)
+            if show_l3: layers.append(3)
+            
+            if layers:
+                html_graph = render_interactive_graph(rag.nx_graph, layers)
+                components.html(html_graph, height=620)
+            else:
+                st.info("Select at least one layer to view.")
+        
         else:
-            st.caption("No tag tree yet.")
+            # Show each MetaMedGraph
+            for mg in rag.meta_graphs:
+                with st.expander(f"📊 {mg.graph_id}  ({len(mg.entities)} entities, {len(mg.relationships)} rels)"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("**Entities (Layer 1)**")
+                        for e in mg.entities:
+                            st.markdown(
+                                f'<span class="entity-chip chip-l1">{e.name}</span>'
+                                f'<small style="color:#8b949e"> {e.entity_type}</small>',
+                                unsafe_allow_html=True,
+                            )
+                        # Cross-layer neighbours
+                        nx_g = rag.nx_graph
+                        l2_links = [
+                            (v, d) for _, v, d in nx_g.out_edges(
+                                [e.name for e in mg.entities], data=True
+                            )
+                            if d.get("relation") == "the_reference_of"
+                        ]
+                        l3_links = [
+                            (v, d) for _, v, d in nx_g.out_edges(
+                                [e.name for e in mg.entities], data=True
+                            )
+                            if d.get("relation") == "the_definition_of"
+                        ]
+                        if l2_links:
+                            st.markdown("**→ Layer-2 References**")
+                            for tgt, d in l2_links[:6]:
+                                st.markdown(
+                                    f'<span class="entity-chip chip-l2">{tgt}</span>'
+                                    f'<small style="color:#8b949e"> sim={d.get("similarity", 0):.2f}</small>',
+                                    unsafe_allow_html=True,
+                                )
+                        if l3_links:
+                            st.markdown("**→ Layer-3 Definitions**")
+                            for tgt, d in l3_links[:6]:
+                                st.markdown(
+                                    f'<span class="entity-chip chip-l3">{tgt}</span>'
+                                    f'<small style="color:#8b949e"> sim={d.get("similarity", 0):.2f}</small>',
+                                    unsafe_allow_html=True,
+                                )
+
+                    with c2:
+                        st.markdown("**Relationships**")
+                        for r in mg.relationships:
+                            st.markdown(
+                                f'`{r.source}` '
+                                f'<span class="relation-badge">{r.relation}</span> '
+                                f'`{r.target}`',
+                                unsafe_allow_html=True,
+                            )
+                        st.markdown("**Tag Summary**")
+                        if mg.tag_summary:
+                            for k, v in mg.tag_summary.items():
+                                st.markdown(
+                                    f'<span class="tag-pill">{k}</span> {v}',
+                                    unsafe_allow_html=True,
+                                )
+
+            st.markdown("---")
+            st.markdown("### 🌲 Tag Tree (Hierarchical Clusters)")
+
+            def render_tree(nodes, depth=0):
+                for node in nodes:
+                    indent = "&nbsp;" * (depth * 4)
+                    ids_str = ", ".join(node["ids"])
+                    tags_str = " ".join(
+                        f'<span class="tag-pill">{k}</span>'
+                        for k in node["tags"].keys()
+                    )
+                    st.markdown(
+                        f'{indent}📁 <b>{ids_str}</b> {tags_str}',
+                        unsafe_allow_html=True,
+                    )
+                    if node["children"]:
+                        render_tree(node["children"], depth + 1)
+
+            if rag.tag_tree:
+                render_tree(rag.tag_tree)
+            else:
+                st.caption("No tag tree yet.")
 
 # ==============================
 # Tab 3 – Architecture
