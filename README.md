@@ -1,76 +1,80 @@
 # MedGraphRAG 🧠🧬
 
-An advanced, locally hosted, Triple-Layer Medical Graph Retrieval-Augmented Generation (RAG) framework designed to eliminate hallucination in LLM healthcare interactions by rigorously anchoring semantic inferences to the authoritative UMLS (Unified Medical Language System) Knowledge Graph.
+**High-Performance database-resident Medical Graph Retrieval-Augmented Generation.**
 
-Based on the architecture proposed in *"Medical Graph RAG: Towards Safe Medical Large Language Model via Graph Retrieval-Augmented Generation"*, this implementation is scaled to natively support end-to-end local knowledge graph ingestion—bypassing rate limits and securely hosting tens of millions of authentic medical concepts exactly where you compute.
-
-## 🚀 Features
-
-- **Triple-Layer Graph Architecture:**
-  - **Layer 1 (Meta-MedGraphs):** Your personal documents & clinical notes structurally chunked and parsed automatically into entities and Semantic Triples.
-  - **Layer 2 (Domain Graph):** Broad medical texts, literature, and internal book repositories to anchor arbitrary LLM knowledge chunks.
-  - **Layer 3 (Core Medical Vocabulary):** High-density backbone powered by a specialized bulk importer capable of gracefully ingesting and indexing ~4M Nodes (concepts from `MRCONSO.RRF` and `MRSTY.RRF`) and ~60M+ Edges (ontologies from `MRREL.RRF`) into a local Neo4j Cluster seamlessly.
-- **U-Retrieval Routing:** Top-Down indexing combined with Bottom-Up semantic retrieval dynamically traverses your private Graph clustering structure, bypassing naive vector-similarity hallucinations.
-- **Intelligent Batch Stream Pipeline:** Features a hyper-optimized Python bulk ingester to map and merge massive multi-gigabyte NIH data distributions directly into Neo4j with exponential index tracking and streaming—bypassing memory overflow bugs native to smaller RAG attempts.
-- **Streamlit Analytics Dashboard:** Highly interactive analytical dashboard and control room for real-time document chunk evaluation, graphical layout mapping, and direct connection pipelines.
-
-## 🛠️ Architecture Stack
-- **Graph Database:** Neo4j (Cypher)
-- **Memory Construction:** NetworkX
-- **Orchestration:** LangChain
-- **Embeddings & LLM Generation:** OpenAI
-- **UI:** Streamlit
+An advanced, Triple-Layer Medical Graph RAG framework designed to eliminate hallucinations in healthcare AI. By anchoring LLM semantic inferences to a **3.5 Million node UMLS (Unified Medical Language System)** backbone stored directly in Neo4j, this system ensures clinical responses are grounded in authoritative ground truth without crashing your machine's RAM.
 
 ---
 
-## 🚦 System Requirements
+## ⚡ Native Database-First Architecture
+This version of MedGraphRAG has been refactored for **Production-Grade Scale**. It offloads all "Million-Node" complexity to Neo4j, allowing the application to run smoothly on standard hardware.
 
-- **Python 3.10+**
-- **Neo4j Desktop / Server Setup** running locally (or remotely)
-- **UMLS Dataset Extracts** downloaded from the NIH National Library of Medicine. Specifically, you need `MRCONSO.RRF`, `MRSTY.RRF`, and `MRREL.RRF` extracted into the root of this project.
-
-## 📦 Installation
-
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/YourUsername/MedGraphRAG-Local.git
-   cd MedGraphRAG-Local
-   ```
-
-2. **Initialize Environment**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows use: venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
-
-3. **Configure the .env variables**
-   Create a `.env` file in the root directory:
-   ```env
-   OPENAI_API_KEY=sk-xxxx...
-   NEO4J_URI=bolt://127.0.0.1:7687
-   NEO4J_USER=neo4j
-   NEO4J_PASSWORD=my_secure_password
-   ```
+- **🚀 Database-Native U-Retrieval**: Performs hierarchical tag traversals directly inside Neo4j. Top-Down search and Bottom-Up refinement deliver evidence-based answers in ~45s.
+- **🔋 Zero-RAM Vocabulary**: The 3.5 Million+ UMLS concepts (Layer 3) reside entirely in Neo4j. Python only handles the active document, keeping RAM usage extremely low.
+- **📦 Persistent Embeddings**: Layer 2 (PubMed) and Layer 3 entities store their vector embeddings directly in the graph. Startup is instant; ingestion doesn't require recalculating known data.
+- **🔗 Vectorized Triple Linking**: High-speed NumPy-based cross-layer linking that bridges patient documents (L1) to medical literature (L2) and vocabulary (L3).
 
 ---
 
-## 💻 Running the Control Room
+## 🏗️ Triple-Layer Architecture
 
-Simply boot the frontend:
+1.  **Layer 1 (Live Evidence):** Your uploaded patient documents and clinical notes, parsed into Semantic Triples.
+2.  **Layer 2 (Medical Literature):** A repository of 14,000+ PubMed articles and reference papers providing clinical context.
+3.  **Layer 3 (Ground Truth):** The medical backbone. 3.5 Million UMLS concepts and 60M+ relationships forming the "dictionary" for all medical reasoning.
+
+---
+
+## 💻 Tech Stack
+- **Graph Engine**: Neo4j (Cypher) - Primary store and traversal engine.
+- **LLM**: GPT-4o-mini (via LangChain) for extraction and refinement.
+- **Embeddings**: Sentence-Transformers (`all-MiniLM-L6-v2`) hosted locally.
+- **UI**: Streamlit with live progress logging for both Ingestion and Retrieval.
+
+---
+
+## 📦 Getting Started
+
+### 1. Installation
 ```bash
-streamlit run app.py
+git clone https://github.com/Hari027/Medical-GraphRAG.git
+cd Medical-GraphRAG
+
+# Setup environment
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-### 🗄️ Ingesting the UMLS Backbone (First Time Setup)
-1. Place the massive raw UMLS dump files `MRCONSO.RRF` and `MRSTY.RRF` directly into the root folder.
-2. In the Streamlit sidebar, select **"📥 Load Local UMLS Nodes"**. (This securely mounts ~4 million fundamental medical definitions tracking directly into your local database using `MERGE` properties + automatic cypher indexing to enforce `O(1)` inserts).
-3. Ensure `MRREL.RRF` is loaded in the root. 
-4. Select **"🔗 Load Local UMLS Relationships"**. The background memory processor will silently build a translation layer mapping the millions of numerical CUI IDs together, bridging up to ~65 Million ontological edges across your architecture in roughly 15 minutes. 
-
-### 📝 Processing Clinical Documents
-Drag and drop unstructured clinical summaries, papers, or patient anonymized reports into the primary document ingestor. The engine will chunk it, tag it against your massive Layer-3 backbone, and allow you to ask RAG questions with supreme accuracy and zero hallucination. 
+### 2. Configuration
+Create a `.env` file in the root:
+```env
+OPENAI_API_KEY=sk-xxxx...
+NEO4J_URI=bolt://127.0.0.1:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your_password
+```
 
 ---
 
+## 📥 Usage Flow
 
+### High-Speed Ingestion
+1. Start the app: `streamlit run app.py`.
+2. Paste your patient document or clinical text.
+3. Click **"Ingest Patient Document"**.
+4. The system will extract entities, link them to the 3.5M node backbone, and build the tag hierarchy in seconds.
+
+### Professional U-Retrieval
+1. Go to the **"Query"** tab.
+2. Ask a complex medical question.
+3. Watch the **live progress** as the system performs:
+   - **Top-Down Search**: Finding the most relevant graph cluster.
+   - **Cross-Layer Expansion**: Pulling clinical neighbors from all 3 layers.
+   - **Bottom-Up Refinement**: Cleaning and verifying the answer using hierarchical tags.
+
+---
+
+## 🔬 Safety & Performance
+- **Deterministic Verification**: No "lucky guesses." Every LLM answer is cross-checked against the Neo4j ontology.
+- **Scalability**: Designed to handle 3.5M+ nodes without performance degradation.
+- **Privacy**: Patient data is processed into a graph format; raw text is never stored in the permanent knowledge base.

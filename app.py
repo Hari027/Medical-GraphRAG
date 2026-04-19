@@ -229,97 +229,8 @@ with st.sidebar:
             placeholder="Paste EHR notes, discharge summaries, case studies…",
         )
 
-    st.markdown("### 📚 Layer 2 – Medical Reference Texts *(optional)*")
-    paper_input = st.text_area(
-        "Paste reference paper/book excerpt(s)",
-        height=100,
-        placeholder="Paste one or more relevant paper abstracts or textbook passages…",
-    )
-    paper_texts = [p.strip() for p in paper_input.split("\n") if p.strip()]
-
     st.markdown("---")
-    st.markdown(f"### 🗂️ Global Knowledge")
-    st.metric("Medical Vocabulary (L3)", len(st.session_state.med_rag.repo_entities_l3))
-    st.caption("This knowledge base persists across documents.")
-
-    seed_btn = st.button("🚀 Bulk Seed (Top 1000)", help="Fetches ~1000 medical concepts from UMLS (takes a few mins)")
-    if seed_btn:
-        terms = get_medical_terms()
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        def update_progress(current, total, msg):
-            progress_bar.progress(current / total)
-            status_text.caption(msg)
-            
-        st.session_state.med_rag.bulk_seed_vocabulary(terms, progress_callback=update_progress)
-        st.success("✅ Seeding complete!")
-        st.rerun()
-
-    import_btn = st.button("📥 Load Local UMLS Nodes", help="Imports MRCONSO.RRF and MRSTY.RRF to build vocabulary nodes")
-    if import_btn:
-        import os
-        if not os.path.exists("MRCONSO.RRF") or not os.path.exists("MRSTY.RRF"):
-            st.error("❌ Could not find MRCONSO.RRF or MRSTY.RRF in the root directory.")
-        else:
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
-            
-            def update_import_progress(val, msg):
-                progress_bar.progress(val)
-                status_text.caption(msg)
-                
-            try:
-                st.session_state.med_rag.import_local_umls_dump(
-                    "MRCONSO.RRF", 
-                    "MRSTY.RRF", 
-                    progress_callback=update_import_progress
-                )
-                st.success("✅ Massive UMLS nodes injected!")
-            except Exception as e:
-                st.error(f"Import failed: {e}")
-            st.rerun()
-
-    rel_btn = st.button("🔗 Load Local UMLS Relationships", help="Imports MRREL.RRF to build ontology edges between existing nodes")
-    if rel_btn:
-        import os
-        if not os.path.exists("MRCONSO.RRF") or not os.path.exists("MRREL.RRF"):
-            st.error("❌ Could not find MRCONSO.RRF or MRREL.RRF in the root directory.")
-        else:
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
-            
-            def update_rel_progress(val, msg):
-                progress_bar.progress(val)
-                status_text.caption(msg)
-                
-            try:
-                st.session_state.med_rag.import_local_umls_relationships_dump(
-                    "MRCONSO.RRF", 
-                    "MRREL.RRF", 
-                    progress_callback=update_rel_progress
-                )
-                st.success("✅ Massive UMLS relationships injected!")
-            except Exception as e:
-                st.error(f"Import failed: {e}")
-            st.rerun()
-            st.rerun()
-        
-    clear_btn = st.button("🗑️ Clear Graph", help="Wipes all memory and detaches all Neo4j nodes")
-    if clear_btn:
-        st.session_state.med_rag.clear_all()
-        st.session_state.build_stats = None
-        st.success("✅ Graph completely cleared")
-        st.rerun()
-
-    clear_rel_btn = st.button("🗑️ Clear Relationships Only", help="Wipes all relationship edges but keeps the nodes intact")
-    if clear_rel_btn:
-        st.session_state.med_rag.clear_all_relationships()
-        st.success("✅ All relationships successfully cleared")
-        st.rerun()
-
-    st.markdown("---")
-    build_btn = st.button("🔨 Build Triple Graph", use_container_width=True)
+    build_btn = st.button("📥 Ingest Patient Document", use_container_width=True)
 
     if build_btn:
         if not user_text.strip():
@@ -334,10 +245,9 @@ with st.sidebar:
                     "\n\n".join(st.session_state.build_log[-5:])
                 )
 
-            with st.spinner("Building triple graph…"):
+            with st.spinner("Processing & inserting into Graph Database…"):
                 stats = rag.load_documents(
                     user_text=user_text,
-                    paper_texts=paper_texts if paper_texts else None,
                     progress_callback=log,
                 )
             st.session_state.build_stats = stats
@@ -358,6 +268,16 @@ with st.sidebar:
 </small>
 </div>
 """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    clear_l1_btn = st.button("🗑️ Clear Patient Documents (Layer 1)", use_container_width=True, help="Wipe only the processed user documents from the backend")
+    if clear_l1_btn:
+        with st.spinner("Clearing Layer 1 data..."):
+            st.session_state.med_rag.clear_layer1()
+        st.session_state.build_stats = None
+        st.session_state.last_result = None
+        st.success("✅ Layer 1 cleared!")
+        st.rerun()
 
 # -------------------------------------------------------------------------
 # Main area
@@ -391,9 +311,17 @@ with tab_query:
             run_query = st.button("🔍 Run U-Retrieval", use_container_width=True)
 
         if run_query and question.strip():
-            with st.spinner("Running U-Retrieval…"):
-                result = rag.query(question)
+            query_log_placeholder = st.empty()
+            st.session_state.query_log = []
+            
+            def q_log(msg: str):
+                st.session_state.query_log.append(msg)
+                query_log_placeholder.markdown(f"*{st.session_state.query_log[-1]}*")
+
+            with st.spinner("Processing Question..."):
+                result = rag.query(question, progress_callback=q_log)
                 st.session_state.last_result = result
+                query_log_placeholder.empty()
 
         if st.session_state.last_result:
             res = st.session_state.last_result

@@ -153,30 +153,38 @@ def _generate_answer(
 ) -> str:
     graph_text = ""
     all_ents = {e.name: e for e in top_entities + top_k_neighbors}
-    for rel in graph.relationships:
+    
+    # Restrict to top 20 relationships to prevent context window bloat
+    for rel in graph.relationships[:20]:
         if rel.source in all_ents or rel.target in all_ents:
             src_e = all_ents.get(rel.source)
             tgt_e = all_ents.get(rel.target)
             src_ctx = f" [{src_e.context[:80]}]" if src_e else ""
             tgt_ctx = f" [{tgt_e.context[:80]}]" if tgt_e else ""
-            # Include definitions and sources from layers 2 & 3
+            
             src_def = ""
             tgt_def = ""
-            if src_e and src_e.layer == 3:
-                src_def = f" (Definition: {src_e.definition})"
-            if tgt_e and tgt_e.layer == 3:
-                tgt_def = f" (Definition: {tgt_e.definition})"
+            if src_e and src_e.layer == 3 and src_e.definition:
+                src_def = f" (Definition: {src_e.definition[:100]}...)"
+            if tgt_e and tgt_e.layer == 3 and tgt_e.definition:
+                tgt_def = f" (Definition: {tgt_e.definition[:100]}...)"
             graph_text += (
                 f"{rel.source}{src_ctx}{src_def} "
                 f"--[{rel.relation}]--> "
                 f"{rel.target}{tgt_ctx}{tgt_def}\n"
             )
 
-    entity_detail = "\n".join(
-        f"• {e.name} ({e.entity_type}, Layer {e.layer}): {e.context}"
-        + (f"\n  Source/Definition: {e.definition}" if e.definition else "")
-        for e in (top_entities + top_k_neighbors)
-    )
+    entity_detail_parts = []
+    for e in (top_entities + top_k_neighbors):
+        ctx_raw = e.context or ""
+        ctx_trun = (ctx_raw[:300] + "...") if len(ctx_raw) > 300 else ctx_raw
+        base = f"• {e.name} ({e.entity_type}, Layer {e.layer}): {ctx_trun}"
+        if e.definition:
+            def_trun = (e.definition[:300] + "...") if len(e.definition) > 300 else e.definition
+            base += f"\n  Source/Definition: {def_trun}"
+        entity_detail_parts.append(base)
+    
+    entity_detail = "\n".join(entity_detail_parts)
 
     prompt = textwrap.dedent(f"""
         You are a medical expert assistant generating evidence-based responses.

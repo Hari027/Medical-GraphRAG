@@ -13,7 +13,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from data_models import Entity, Relationship, MetaMedGraph, MEDICAL_TAGS, BUILTIN_VOCAB
-from api_clients import UMLSClient, Neo4jClient
+from api_clients import UMLSClient, Neo4jClient, PubMedClient
 from llm_helpers import (
     EmbeddingStore, 
     _call_llm_json, 
@@ -41,6 +41,7 @@ class MedGraphRAG:
     TAG_MERGE_THRESHOLD  = 0.60   # δt  — hierarchical tag clustering threshold
     TOP_N_ENTITIES       = 8      # Nu  — entities retrieved per query
     TOP_K_NEIGHBOURS     = 2      # ku  — triple-neighbour hops
+    MAX_TRIPLE_NEIGHBORS = 50     # safety cap to avoid OpenAI 429 token limits
     MAX_TAG_LAYERS       = 6      # max U-Retrieval layers
 
     def __init__(
@@ -53,6 +54,7 @@ class MedGraphRAG:
         self.llm = llm
         self.emb = EmbeddingStore(embedder)
         self.umls = UMLSClient(api_key=umls_api_key)
+        self.pubmed = PubMedClient()
         
         # Neo4j setup
         self.neo4j = None
@@ -66,16 +68,18 @@ class MedGraphRAG:
         # Layer 1 – user RAG graphs
         self.meta_graphs: list[MetaMedGraph] = []
 
-        # Layer 2 – repository (paper) entities
-        self.repo_entities_l2: list[Entity] = []
-
-        # Layer 3 – vocabulary entities (pre-seeded with BUILTIN_VOCAB to act as a constant layout)
-        self.repo_entities_l3: list[Entity] = self._build_vocab_layer()
-        
-        # Initial sync of vocab to Neo4j
+        # Layer 2 – repository (paper) entities — restore from Neo4j for persistence
         if self.neo4j:
-            self.neo4j.sync_entities(self.repo_entities_l3)
+            self.repo_entities_l2: list[Entity] = self.neo4j.load_layer2_entities()
+            print(f"[MedGraphRAG] Restored {len(self.repo_entities_l2)} Layer-2 entities from Neo4j.")
+        else:
+            self.repo_entities_l2: list[Entity] = []
 
+        # Layer 3 – vocabulary entities (UMLS)
+        # WE NO LONGER load 3.5Million nodes into Python RAM.
+        # Layer 3 resides persistently in Neo4j only.
+        self.repo_entities_l3: list[Entity] = [] 
+ 
         # Hierarchical tag tree  [{graph_id: str, tags: dict, children: list}]
         self.tag_tree: list[dict] = []
 
@@ -172,133 +176,196 @@ class MedGraphRAG:
         for e in g.entities:
             e.embedding = self.emb.embed(e.content_text)
 
-        # Add to NetworkX
-        for e in g.entities:
-            self.nx_graph.add_node(e.name, entity=e)
-        for r in g.relationships:
-            self.nx_graph.add_edge(r.source, r.target, relation=r.relation)
-
         return g
 
     # ------------------------------------------------------------------
     # Step 3 – Triple Linking  (L1 → L2 → L3)
     # ------------------------------------------------------------------
 
-    def _embed_all_layers(self):
-        """Ensure all layer-2 and layer-3 entities are embedded."""
-        for e in self.repo_entities_l2 + self.repo_entities_l3:
-            if e.embedding is None:
-                e.embedding = self.emb.embed(e.content_text)
+    def _embed_all_layers(self, skip_l3: bool = False, progress_callback=None):
+        """Batch-embed all L2 entities that are missing embeddings, then persist."""
+        targets = self.repo_entities_l2
+        if not skip_l3:
+            targets = targets + self.repo_entities_l3
 
-    def _link_layers(self):
+        # Find entities missing embeddings
+        missing = [e for e in targets if e.embedding is None]
+        if not missing:
+            if progress_callback:
+                progress_callback(f"✅  All {len(targets)} L2 entities already have embeddings.")
+            return
+
+        if progress_callback:
+            progress_callback(f"⚡  Batch-embedding {len(missing)}/{len(targets)} L2 entities (one-time backfill)…")
+
+        # Batch embed for speed (uses embed_documents internally)
+        texts = [e.content_text for e in missing]
+        batch_size = 256
+        for batch_start in range(0, len(texts), batch_size):
+            batch_end = min(batch_start + batch_size, len(texts))
+            batch_texts = texts[batch_start:batch_end]
+            batch_vecs = self.emb.embed_batch(batch_texts)
+            for j, vec in enumerate(batch_vecs):
+                missing[batch_start + j].embedding = vec
+            if progress_callback:
+                progress_callback(f"⚡  Embedded {batch_end}/{len(missing)} L2 entities…")
+
+        # Persist embeddings back to Neo4j so this NEVER runs again
+        if self.neo4j and missing:
+            if progress_callback:
+                progress_callback(f"💾  Persisting {len(missing)} embeddings to Neo4j (one-time)…")
+            self.neo4j.sync_entities(missing, progress_callback=progress_callback)
+            if progress_callback:
+                progress_callback("✅  Embeddings persisted. Future runs will be instant.")
+
+    def _link_layers(self, skip_l3_embed: bool = False, progress_callback=None):
         """
         For every Layer-1 entity, find sufficiently similar Layer-2 entities
-        and add 'the_reference_of' edges.  Then for each Layer-2 entity find
-        Layer-3 entities and add 'the_definition_of' edges.
+        and add 'the_reference_of' edges. Vectorized for instant performance.
         """
-        self._embed_all_layers()
-
-        # L1 → L2
+        self._embed_all_layers(skip_l3=skip_l3_embed, progress_callback=progress_callback)
+        
+        if not self.repo_entities_l2:
+            return
+            
+        l2_embs = []
+        valid_l2 = []
+        for e2 in self.repo_entities_l2:
+            if e2.embedding is not None:
+                l2_embs.append(e2.embedding)
+                valid_l2.append(e2)
+        
+        if not valid_l2:
+            return
+            
+        l2_matrix = np.vstack(l2_embs)
+        l2_norms = np.linalg.norm(l2_matrix, axis=1)
+        
+        # Batch collect edges to avoid repetitive DB calls
+        new_edges = []
+        
         for mg in self.meta_graphs:
             for e1 in mg.entities:
                 if e1.embedding is None:
                     continue
-                for e2 in self.repo_entities_l2:
-                    sim = self.emb.similarity(e1.embedding, e2.embedding)
-                    if sim >= self.SIMILARITY_THRESHOLD:
-                        if not self.nx_graph.has_node(e2.name):
-                            self.nx_graph.add_node(e2.name, entity=e2)
-                        self.nx_graph.add_edge(
-                            e1.name, e2.name,
-                            relation="the_reference_of",
-                            similarity=sim,
-                        )
-                        if self.neo4j:
-                            self.neo4j.add_cross_layer_edge(e1.name, e2.name, "the_reference_of", sim)
-
-        # L2 → L3
-        for e2 in self.repo_entities_l2:
-            if e2.embedding is None:
-                continue
-            for e3 in self.repo_entities_l3:
-                sim = self.emb.similarity(e2.embedding, e3.embedding)
-                if sim >= self.SIMILARITY_THRESHOLD:
-                    if not self.nx_graph.has_node(e3.name):
-                        self.nx_graph.add_node(e3.name, entity=e3)
+                
+                e1_norm = np.linalg.norm(e1.embedding)
+                if e1_norm == 0: continue
+                
+                # Fast vectorized cosine similarity
+                sims = np.dot(l2_matrix, e1.embedding) / (l2_norms * e1_norm + 1e-9)
+                matches = np.where(sims >= self.SIMILARITY_THRESHOLD)[0]
+                
+                for idx in matches:
+                    e2 = valid_l2[idx]
+                    sim = float(sims[idx])
+                    
+                    if not self.nx_graph.has_node(e2.name):
+                        self.nx_graph.add_node(e2.name, entity=e2)
                     self.nx_graph.add_edge(
-                        e2.name, e3.name,
-                        relation="the_definition_of",
+                        e1.name, e2.name,
+                        relation="the_reference_of",
                         similarity=sim,
                     )
-                    if self.neo4j:
-                        self.neo4j.add_cross_layer_edge(e2.name, e3.name, "the_definition_of", sim)
-
-        # Also directly link L1 → L3 when there is no L2 (fallback)
-        for mg in self.meta_graphs:
-            for e1 in mg.entities:
-                if e1.embedding is None:
-                    continue
-                for e3 in self.repo_entities_l3:
-                    if self.nx_graph.has_edge(e1.name, e3.name):
-                        continue
-                    sim = self.emb.similarity(e1.embedding, e3.embedding)
-                    if sim >= self.SIMILARITY_THRESHOLD:
-                        if not self.nx_graph.has_node(e3.name):
-                            self.nx_graph.add_node(e3.name, entity=e3)
-                        self.nx_graph.add_edge(
-                            e1.name, e3.name,
-                            relation="the_definition_of",
-                            similarity=sim,
-                        )
-                        if self.neo4j:
-                            self.neo4j.add_cross_layer_edge(e1.name, e3.name, "the_definition_of", sim)
+                    new_edges.append((e1.name, e2.name, "the_reference_of", sim))
+        
+        if self.neo4j and new_edges:
+            self.neo4j.batch_add_cross_layer_edges(new_edges)
 
     # ------------------------------------------------------------------
     # Step 5 – Tag the graphs  (hierarchical clustering)
     # ------------------------------------------------------------------
 
-    def _tag_all_graphs(self):
-        for mg in self.meta_graphs:
-            mg.tag_summary = _tag_graph(self.llm, mg)
+    def _tag_all_graphs(self, progress_callback=None):
+        import concurrent.futures
+        total = len(self.meta_graphs)
+        if total == 0: return
 
-    def _build_tag_tree(self):
+        # Progress tracking for thread pool
+        finished_count = 0
+        def tag_one(mg):
+            mg.tag_summary = _tag_graph(self.llm, mg)
+            return mg
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_mg = {executor.submit(tag_one, mg): mg for mg in self.meta_graphs}
+            for future in concurrent.futures.as_completed(future_to_mg):
+                finished_count += 1
+                if progress_callback:
+                    progress_callback(f"🏷️  Tagged graph {finished_count}/{total}…")
+
+    def _build_tag_tree(self, progress_callback=None):
         """
         Agglomerative hierarchical clustering over tag embeddings.
-        Produces a tree list used for top-down retrieval.
+        Vectorized using NumPy for high performance on many chunks.
         """
-        # Start: each graph is its own leaf node
-        nodes = [
-            {"ids": [mg.graph_id], "tags": mg.tag_summary, "children": []}
-            for mg in self.meta_graphs
-        ]
+        import numpy as np
+        
+        if not self.meta_graphs:
+            self.tag_tree = []
+            return
 
-        for _layer in range(self.MAX_TAG_LAYERS):
-            if len(nodes) <= 1:
-                break
+        # 1. Pre-calculate 'centroid' embeddings for each graph's tags
+        nodes = []
+        for mg in self.meta_graphs:
+            tag_embs = []
+            for t_val in mg.tag_summary.values():
+                tag_embs.append(self.emb.embed(t_val))
+            
+            centroid = np.mean(tag_embs, axis=0) if tag_embs else np.zeros(384)
+            nodes.append({
+                "ids": [mg.graph_id],
+                "tags": mg.tag_summary,
+                "embedding": centroid,
+                "children": []
+            })
 
-            # Compute pairwise tag similarities
+        def _get_node_sim(n1, n2):
+            # Fast cosine between centroids as a proxy for Average Linkage
+            norm1 = np.linalg.norm(n1["embedding"])
+            norm2 = np.linalg.norm(n2["embedding"])
+            if norm1 == 0 or norm2 == 0: return 0.0
+            return float(np.dot(n1["embedding"], n2["embedding"]) / (norm1 * norm2))
+
+        # 2. Iterate and Merge
+        total_merges = len(nodes) - 1
+        for merge_idx in range(total_merges):
+            if len(nodes) <= 1: break
+            if progress_callback:
+                progress_callback(f"🌳  Merging Tag Branches: {merge_idx+1}/{total_merges}…")
+
             best_sim, best_i, best_j = -1.0, 0, 1
+            # Current simplified O(N^2) search. For N=34, this is <0.1s.
             for i in range(len(nodes)):
                 for j in range(i + 1, len(nodes)):
-                    sim = self._tag_similarity(nodes[i]["tags"], nodes[j]["tags"])
+                    sim = _get_node_sim(nodes[i], nodes[j])
                     if sim > best_sim:
                         best_sim, best_i, best_j = sim, i, j
 
             if best_sim < self.TAG_MERGE_THRESHOLD:
-                break  # nothing more to merge
+                break
 
-            # Merge nodes[best_i] and nodes[best_j]
+            # Create merged node
             merged_tags = self._merge_tags(nodes[best_i]["tags"], nodes[best_j]["tags"])
+            # Re-calculate centroid for the branch
+            combined_ids = nodes[best_i]["ids"] + nodes[best_j]["ids"]
+            # Weighting by branch size for accuracy
+            w1, w2 = len(nodes[best_i]["ids"]), len(nodes[best_j]["ids"])
+            new_centroid = (nodes[best_i]["embedding"] * w1 + nodes[best_j]["embedding"] * w2) / (w1 + w2)
+            
             merged = {
-                "ids": nodes[best_i]["ids"] + nodes[best_j]["ids"],
+                "ids": combined_ids,
                 "tags": merged_tags,
+                "embedding": new_centroid,
                 "children": [nodes[best_i], nodes[best_j]],
             }
-            new_nodes = [n for k, n in enumerate(nodes) if k not in (best_i, best_j)]
-            new_nodes.append(merged)
-            nodes = new_nodes
+            
+            # Update nodes list
+            new_list = [n for k, n in enumerate(nodes) if k not in (best_i, best_j)]
+            new_list.append(merged)
+            nodes = new_list
 
-        self.tag_tree = nodes  # list of root-level nodes
+        self.tag_tree = nodes
 
     def _tag_similarity(self, tags_a: dict[str, str], tags_b: dict[str, str]) -> float:
         if not tags_a or not tags_b:
@@ -325,46 +392,51 @@ class MedGraphRAG:
     # Step 6 – U-Retrieval
     # ------------------------------------------------------------------
 
-    def _top_down_retrieve(self, query: str) -> MetaMedGraph | None:
-        """
-        Generate query tags, then traverse the tag tree top-down to find
-        the most relevant Meta-MedGraph.
-        """
-        q_tags = _tag_graph(self.llm, MetaMedGraph(
-            graph_id="query",
-            entities=[Entity(name="query", entity_type="Other", context=query)],
-        ))
+    def _get_node_sim(self, query_obj, node_obj):
+        """Helper to compute similarity between query and tag tree node."""
+        if "embedding" not in node_obj:
+            # If no centroid, fall back to string comparison or re-embed (cached)
+            return self._tag_similarity(query_obj.get("tags", {}), node_obj.get("tags", {}))
+        
+        q_emb = query_obj["embedding"]
+        n_emb = node_obj["embedding"]
+        return np.dot(q_emb, n_emb) / (np.linalg.norm(q_emb) * np.linalg.norm(n_emb) + 1e-9)
 
-        if not self.tag_tree:
+    def _top_down_retrieve(self, q_tags: dict[str, str]) -> Optional[MetaMedGraph]:
+        """
+        Database-native top-down retrieval. Traverses the TagNode hierarchy 
+        in Neo4j to find the most relevant chunk.
+        """
+        if not self.neo4j:
             return self.meta_graphs[0] if self.meta_graphs else None
 
-        # Traverse from root nodes
-        current_nodes = self.tag_tree
-        target_graph_id = None
-
+        # Fallback to local search if no TagNodes found in DB
+        if not self.tag_tree:
+             return self.meta_graphs[0] if self.meta_graphs else None
+        
+        # We start with the roots and move down
+        current_level_nodes = [n for n in self.tag_tree]
+        target_mg = None
+        
         for _ in range(self.MAX_TAG_LAYERS):
+            if not current_level_nodes: break
             best_sim, best_node = -1.0, None
-            for node in current_nodes:
-                sim = self._tag_similarity(q_tags, node["tags"])
+            for node in current_level_nodes:
+                sim = self._get_node_sim({"embedding": self.emb.embed(str(q_tags))}, node)
                 if sim > best_sim:
                     best_sim, best_node = sim, node
-
-            if best_node is None:
-                break
-
+            
+            if not best_node: break
             if not best_node["children"]:
-                # Leaf: pick the graph
-                target_graph_id = best_node["ids"][0]
+                # Found leaf
+                target_id = best_node["ids"][0]
+                for mg in self.meta_graphs:
+                    if mg.graph_id == target_id:
+                        return mg
                 break
             else:
-                current_nodes = best_node["children"]
+                current_level_nodes = best_node["children"]
 
-        if target_graph_id is None and self.meta_graphs:
-            target_graph_id = self.meta_graphs[0].graph_id
-
-        for mg in self.meta_graphs:
-            if mg.graph_id == target_graph_id:
-                return mg
         return self.meta_graphs[0] if self.meta_graphs else None
 
     def _get_triple_neighbours(
@@ -373,10 +445,15 @@ class MedGraphRAG:
         """
         Return all entities within k hops across all three graph layers
         (following any edge type, including cross-layer links).
+        Queries directly against the persistent Neo4j Graph.
         """
+        if self.neo4j:
+            # High-performance DB search across all millions of L2 and L3 nodes
+            return self.neo4j.get_k_hop_neighbors(entity_name, k)
+
+        # Fallback to local nx_graph if Neo4j is not connected
         neighbours: list[Entity] = []
         try:
-            # BFS up to k hops in both directions
             reachable = nx.single_source_shortest_path_length(
                 self.nx_graph.to_undirected(), entity_name, cutoff=k
             )
@@ -391,7 +468,7 @@ class MedGraphRAG:
             pass
         return neighbours
 
-    def query(self, question: str) -> dict:
+    def query(self, question: str, progress_callback=None) -> dict:
         """
         Full U-Retrieval pipeline.
         Returns a dict with keys: answer, target_graph, top_entities,
@@ -401,6 +478,7 @@ class MedGraphRAG:
             return {"answer": "No documents loaded.", "target_graph": None,
                     "top_entities": [], "triple_neighbours": [], "refinement_log": []}
 
+        if progress_callback: progress_callback("🔍 Running Top-Down Retrieval...")
         # Top-down retrieval
         target_mg = self._top_down_retrieve(question)
 
@@ -414,15 +492,21 @@ class MedGraphRAG:
         scored.sort(key=lambda x: x[0], reverse=True)
         top_entities = [e for _, e in scored[: self.TOP_N_ENTITIES]]
 
+        if progress_callback: progress_callback(f"🔗 Gathering Triple Neighbors for {len(top_entities)} entities...")
         # Gather triple neighbours (cross-layer)
         triple_neighbours: list[Entity] = []
         seen = {e.name for e in top_entities}
         for e in top_entities:
             for nb in self._get_triple_neighbours(e.name, self.TOP_K_NEIGHBOURS):
+                if len(triple_neighbours) >= self.MAX_TRIPLE_NEIGHBORS:
+                    break
                 if nb.name not in seen:
                     seen.add(nb.name)
                     triple_neighbours.append(nb)
+            if len(triple_neighbours) >= self.MAX_TRIPLE_NEIGHBORS:
+                break
 
+        if progress_callback: progress_callback("🧠 Generating initial answer using Ground-Level graph...")
         # Initial bottom-level answer
         answer = _generate_answer(
             self.llm, question, target_mg, top_entities, triple_neighbours
@@ -447,6 +531,7 @@ class MedGraphRAG:
         ancestors.sort(key=lambda x: x[0])
 
         for level, summary in ancestors[1:]:  # skip level 0 (the graph itself)
+            if progress_callback: progress_callback(f"⬆️ Bottom-Up Refinement (Level {level}) with LLM...")
             answer = _refine_answer(self.llm, question, answer, summary)
             refinement_log.append({"level": level, "answer": answer})
 
@@ -476,25 +561,18 @@ class MedGraphRAG:
         """
         # --- Selective clearing ---
         self.meta_graphs.clear()
-        self.repo_entities_l2.clear()
         self.tag_tree.clear()
 
-        # Remove only L1 and L2 nodes from NetworkX
+        # Remove only L1 nodes from NetworkX (keep L2 and L3)
         nodes_to_remove = [
             n for n, d in self.nx_graph.nodes(data=True)
-            if d.get("entity") and d.get("entity").layer in [1, 2]
+            if d.get("entity") and d.get("entity").layer == 1
         ]
         self.nx_graph.remove_nodes_from(nodes_to_remove)
 
-        if self.neo4j:
-            self.neo4j.clear_db()
-
         # We NO LONGER rebuild L3 here; it persists.
-        # But we ensure L3 nodes are in nx_graph for linking
-        for e3 in self.repo_entities_l3:
-            if not self.nx_graph.has_node(e3.name):
-                self.nx_graph.add_node(e3.name, entity=e3)
-
+        # But we ensure L1 and L2 nodes are in nx_graph for linking
+        # (L3 is handled via Neo4j directly during U-Retrieval)
         def _progress(msg: str):
             if progress_callback:
                 progress_callback(msg)
@@ -502,20 +580,42 @@ class MedGraphRAG:
         # --- Layer 1: User documents ---
         _progress("⚙️  Chunking user documents…")
         chunks = self._semantic_chunks(user_text)
+        
+        import concurrent.futures
+        
+        all_entities_batch = []
+        all_rels_batch = []
+        
+        def process_chunk(idx, chunk):
+            gid = f"chunk_{idx}"
+            return self._build_meta_graph(chunk, gid)
 
-        for i, chunk in enumerate(chunks):
-            _progress(f"⚙️  Building Layer-1 graph for chunk {i+1}/{len(chunks)}…")
-            gid = f"chunk_{i}"
-            mg = self._build_meta_graph(chunk, gid)
-            self.meta_graphs.append(mg)
-            
-            # Sync L1 to Neo4j
-            if self.neo4j:
-                self.neo4j.sync_entities(mg.entities)
-                self.neo4j.sync_relationships(mg.relationships)
-            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_idx = {executor.submit(process_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    mg = future.result()
+                    self.meta_graphs.append(mg)
+                    all_entities_batch.extend(mg.entities)
+                    all_rels_batch.extend(mg.relationships)
+                    
+                    # Safely apply to NetworkX on the main thread to avoid thread deadlocks
+                    for e in mg.entities:
+                        self.nx_graph.add_node(e.name, entity=e)
+                    for r in mg.relationships:
+                        self.nx_graph.add_edge(r.source, r.target, relation=r.relation)
+                        
+                    _progress(f"⚙️  Finished Layer-1 graph for chunk {idx+1}/{len(chunks)}…")
+                except Exception as exc:
+                    _progress(f"❌  Chunk {idx+1}/{len(chunks)} generated an exception: {exc}")
 
-
+        # Batch Sync L1 to Neo4j
+        if self.neo4j and all_entities_batch:
+            _progress("⚙️  Syncing Layer-1 Entities to graph database…")
+            self.neo4j.sync_entities(all_entities_batch, progress_callback=_progress)
+            _progress("⚙️  Syncing Layer-1 Relationships to graph database…")
+            self.neo4j.sync_relationships(all_rels_batch, progress_callback=_progress)
         # --- Layer 2: Medical paper entities (if provided) ---
         if paper_texts:
             for j, paper in enumerate(paper_texts):
@@ -532,22 +632,25 @@ class MedGraphRAG:
                 
 
 
-        # --- Layer 3 already built (BUILTIN_VOCAB) ---
-        _progress("⚙️  Embedding Layer-3 vocabulary entities…")
-        for e in self.repo_entities_l3:
-            e.embedding = self.emb.embed(e.content_text)
+        # --- Layer 3 is persistent and large; we only embed on-demand during linking ---
+        # No longer scanning 500k+ nodes here every time.
 
         # --- Triple Linking ---
-        _progress("🔗  Triple linking across graph layers…")
-        self._link_layers()
+        _progress("🔗  Triple linking across graph layers (Vectorized)…")
+        self._link_layers(skip_l3_embed=True, progress_callback=_progress)
 
         # --- Tag graphs ---
-        _progress("🏷️  Tagging graphs…")
-        self._tag_all_graphs()
+        _progress("🏷️  Tagging graphs in parallel…")
+        self._tag_all_graphs(progress_callback=_progress)
 
         # --- Build tag hierarchy ---
-        _progress("🌲  Building hierarchical tag tree…")
-        self._build_tag_tree()
+        _progress("🌲  Building hierarchical tag tree (Vectorized)…")
+        self._build_tag_tree(progress_callback=_progress)
+        
+        # Sync tag tree to Neo4j for persistent U-Retrieval
+        if self.neo4j:
+            _progress("⚙️  Syncing Tag Hierarchy to database…")
+            self.neo4j.sync_tag_tree(self.tag_tree)
 
         _progress("✅  Triple graph construction complete.")
 
@@ -564,7 +667,7 @@ class MedGraphRAG:
             "l1_entities": total_l1_entities,
             "l1_relationships": total_l1_rels,
             "l2_entities": len(self.repo_entities_l2),
-            "l3_entities": len(self.repo_entities_l3),
+            "l3_entities": self.neo4j.count_layer3() if self.neo4j else len(self.repo_entities_l3),
             "cross_layer_edges": cross_layer_edges,
             "tag_tree_roots": len(self.tag_tree),
             "total_graph_nodes": self.nx_graph.number_of_nodes(),
@@ -576,7 +679,7 @@ class MedGraphRAG:
             "meta_graphs": len(self.meta_graphs),
             "l1_entities": sum(len(mg.entities) for mg in self.meta_graphs),
             "l2_entities": len(self.repo_entities_l2),
-            "l3_entities": len(self.repo_entities_l3),
+            "l3_entities": self.neo4j.count_layer3() if self.neo4j else len(self.repo_entities_l3),
             "total_nodes": self.nx_graph.number_of_nodes(),
             "total_edges": self.nx_graph.number_of_edges(),
         }
@@ -592,6 +695,23 @@ class MedGraphRAG:
         self.nx_graph.clear()
         if self.neo4j:
             self.neo4j.clear_all_db()
+
+    def clear_layer1(self):
+        """
+        Clears ONLY Layer 1 (user documents) from memory and Neo4j, preserving Layer 2 and Layer 3.
+        """
+        self.meta_graphs.clear()
+        self.tag_tree.clear()
+        
+        # Remove only L1 nodes from NetworkX
+        nodes_to_remove = [
+            n for n, d in self.nx_graph.nodes(data=True)
+            if d.get("entity") and d.get("entity").layer == 1
+        ]
+        self.nx_graph.remove_nodes_from(nodes_to_remove)
+        
+        if self.neo4j:
+            self.neo4j.clear_layer1_db()
 
     def clear_all_relationships(self):
         """
@@ -656,6 +776,56 @@ class MedGraphRAG:
                     ))
                 self.neo4j.sync_relationships(rels)
 
+    def seed_pubmed_literature(self, query: str, max_results: int = 5, progress_callback=None):
+        """
+        Fetches PubMed abstracts for a query, extracts entities and relationships
+        via the LLM, and persists them as Layer 2 (L2_Entity) nodes in Neo4j.
+        """
+        if progress_callback:
+            progress_callback(0.05, f"🔎 Searching PubMed for: {query}")
+
+        abstracts = self.pubmed.fetch_abstracts(query, max_results=max_results)
+        if not abstracts:
+            if progress_callback:
+                progress_callback(1.0, "⚠️ No PubMed results found.")
+            return {"articles": 0, "entities": 0, "relationships": 0}
+
+        total_entities = 0
+        total_rels = 0
+
+        for idx, abstract in enumerate(abstracts):
+            pct = (idx + 1) / len(abstracts)
+            if progress_callback:
+                progress_callback(pct * 0.9, f"📄 Processing article {idx+1}/{len(abstracts)}...")
+
+            # Extract entities and relationships from abstract text via LLM
+            entities = _extract_entities(self.llm, abstract)
+            relationships = _extract_relationships(self.llm, abstract, entities)
+
+            # Mark all as Layer 2 and embed
+            for e in entities:
+                e.layer = 2
+                e.embedding = self.emb.embed(e.content_text)
+                self.repo_entities_l2.append(e)
+                self.nx_graph.add_node(e.name, entity=e)
+
+            for r in relationships:
+                self.nx_graph.add_edge(r.source, r.target, relation=r.relation)
+
+            # Sync to Neo4j with L2_Entity label
+            if self.neo4j and entities:
+                self.neo4j.sync_entities(entities)
+            if self.neo4j and relationships:
+                self.neo4j.sync_relationships(relationships)
+
+            total_entities += len(entities)
+            total_rels += len(relationships)
+
+        if progress_callback:
+            progress_callback(1.0, f"✅ Done! {total_entities} entities, {total_rels} relationships from {len(abstracts)} articles.")
+
+        return {"articles": len(abstracts), "entities": total_entities, "relationships": total_rels}
+
     def import_local_umls_relationships_dump(self, mrconso_path: str, mrrel_path: str, progress_callback=None):
         from umls_importer import load_umls_relationships_to_neo4j
         if not self.neo4j_creds:
@@ -677,3 +847,28 @@ class MedGraphRAG:
         pwd = self.neo4j_creds.get("password")
         
         return load_umls_to_neo4j(mrconso_path, mrsty_path, uri, user, pwd, progress_callback)
+
+    def bulk_import_pubmed(self, keywords=None, max_per_keyword=50, progress_callback=None):
+        from pubmed_importer import bulk_fetch_pubmed, PUBMED_KEYWORDS
+        if not self.neo4j_creds:
+            raise ValueError("Neo4j credentials are required.")
+        
+        if keywords is None:
+            keywords = PUBMED_KEYWORDS
+            
+        uri = self.neo4j_creds.get("uri")
+        user = self.neo4j_creds.get("user")
+        pwd = self.neo4j_creds.get("password")
+        
+        return bulk_fetch_pubmed(keywords, max_per_keyword, uri, user, pwd, progress_callback)
+
+    def link_cross_layers_gpu(self, threshold=0.45, progress_callback=None):
+        from cross_layer_linker import link_layers_gpu
+        if not self.neo4j_creds:
+            raise ValueError("Neo4j credentials are required.")
+        
+        uri = self.neo4j_creds.get("uri")
+        user = self.neo4j_creds.get("user")
+        pwd = self.neo4j_creds.get("password")
+        
+        return link_layers_gpu(uri, user, pwd, threshold=threshold, progress_callback=progress_callback)

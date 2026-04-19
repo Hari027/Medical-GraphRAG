@@ -6,6 +6,7 @@ __pycache__/
 
 # Virtual environment
 venv/
+venv_gpu/
 env/
 
 # Environment variables (VERY IMPORTANT)
@@ -20,3 +21,15 @@ Thumbs.db
 
 # UMLS Raw Datasets
 *.RRF
+
+# Large ML/Embedding Artifacts
+*.dat
+*.bin
+*.pt
+*.pth
+
+# Developer Scratchpad
+scratch/
+patch_*.py
+check_gpu.py
+l3_embeddings.dat
