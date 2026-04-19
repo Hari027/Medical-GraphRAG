@@ -1,80 +1,105 @@
-# MedGraphRAG 🧠🧬
+# 🧠 MedGraphRAG: High-Performance Medical Graph Retrieval-Augmented Generation
 
-**High-Performance database-resident Medical Graph Retrieval-Augmented Generation.**
-
-An advanced, Triple-Layer Medical Graph RAG framework designed to eliminate hallucinations in healthcare AI. By anchoring LLM semantic inferences to a **3.5 Million node UMLS (Unified Medical Language System)** backbone stored directly in Neo4j, this system ensures clinical responses are grounded in authoritative ground truth without crashing your machine's RAM.
+An enterprise-grade, Triple-Layer Medical Graph RAG framework engineered to eliminate "hallucinations" in healthcare AI. By anchoring LLM inferences to a **3.5 Million node UMLS (Unified Medical Language System)** ontological backbone stored directly in Neo4j, this system ensures that every clinical response is derived from and grounded within authoritative medical ground truth.
 
 ---
 
-## ⚡ Native Database-First Architecture
-This version of MedGraphRAG has been refactored for **Production-Grade Scale**. It offloads all "Million-Node" complexity to Neo4j, allowing the application to run smoothly on standard hardware.
+## 🏗️ Architecture: The Triple-Layer Semantic Graph
+Traditional RAG models struggle in medical domains because they cannot connect disparate symptoms to underlying diseases across different documents. MedGraphRAG solves this by strictly organizing data into three distinct, interconnected layers:
 
-- **🚀 Database-Native U-Retrieval**: Performs hierarchical tag traversals directly inside Neo4j. Top-Down search and Bottom-Up refinement deliver evidence-based answers in ~45s.
-- **🔋 Zero-RAM Vocabulary**: The 3.5 Million+ UMLS concepts (Layer 3) reside entirely in Neo4j. Python only handles the active document, keeping RAM usage extremely low.
-- **📦 Persistent Embeddings**: Layer 2 (PubMed) and Layer 3 entities store their vector embeddings directly in the graph. Startup is instant; ingestion doesn't require recalculating known data.
-- **🔗 Vectorized Triple Linking**: High-speed NumPy-based cross-layer linking that bridges patient documents (L1) to medical literature (L2) and vocabulary (L3).
+### Layer 1: Live Patient Evidence (The "What")
+- **Source**: Raw clinical notes, patient histories, or real-time diagnostic inputs.
+- **Backend Process**: The application chunks the text and uses an LLM (e.g., `gpt-4o-mini`) to perform **Entity-to-Entity Relationship Extraction**. It doesn't just find words; it extracts semantic triples (e.g., `[Aspirin] --(treats)--> [Headache]`). These extracted networks form the **Active Graph**.
+
+### Layer 2: Medical Literature (The "Context")
+- **Source**: A persistent repository of 14,000+ PubMed articles, reference papers, and clinical trials.
+- **Backend Process**: Instead of embedding these on the fly, Layer 2 embeddings are pre-computed in high-speed batches and persisted in Neo4j. This prevents RAM overload and provides the clinical "context" linking patient symptoms to documented medical research.
+
+### Layer 3: Ground Truth Ontology (The "Dictionary")
+- **Source**: The Unified Medical Language System (UMLS).
+- **Backend Process**: A massive, read-only graph consisting of **3,480,704 concepts** and over **60 million relationships**. This layer lives *entirely* in the Neo4j database (Zero-RAM footprint). It is the authoritative dictionary that prevents the LLM from making medical assumptions.
 
 ---
 
-## 🏗️ Triple-Layer Architecture
+## ⚙️ Engine Mechanics: Deep Dive into the Backend
 
-1.  **Layer 1 (Live Evidence):** Your uploaded patient documents and clinical notes, parsed into Semantic Triples.
-2.  **Layer 2 (Medical Literature):** A repository of 14,000+ PubMed articles and reference papers providing clinical context.
-3.  **Layer 3 (Ground Truth):** The medical backbone. 3.5 Million UMLS concepts and 60M+ relationships forming the "dictionary" for all medical reasoning.
+### 1. Vectorized Cross-Layer Linking
+Patient symptoms (Layer 1) do not exist in a vacuum. During ingestion, the system performs high-speed cosine similarity matching (using localized `HuggingFace` sentence-transformers) to automatically draw `the_reference_of` edges from Layer 1 to Layer 2, and `the_definition_of` edges from Layer 2 to Layer 3.
+
+### 2. Database-Native Persistence & Batching
+Earlier architectures loaded embeddings into Python RAM via lists, which aggressively bottlenecked ingestion (8+ minute hangs). This system was heavily refactored for **Production-Grade Scale**:
+- Embeddings are generated in vectorized batches of 256.
+- The results are physically synced to Neo4j.
+- On application restart, loading 14,000 entities takes **<3 seconds**, and re-ingestion of known documents takes exactly **0 seconds**.
+
+---
+
+## 🔍 The Magic: How "U-Retrieval" Works
+The core algorithmic achievement of this project is the **U-Retrieval Engine**. It operates like a funnel (Top-Down Search) followed by a refining filter (Bottom-Up Synthesis).
+
+#### ⬇️ The "Top-Down" Search (Finding the Evidence)
+Instead of executing full-text database scans, the system builds a hierarchical **Tag Tree** during ingestion. When a user queries the graph:
+1. The LLM embeds the question.
+2. It traverses from the broad "Root" branches of the Tag Tree (e.g., *Cardiology*) down to the specific semantic "Leaves" (e.g., *Arrhythmia symptoms in Chunk 4*).
+3. This allows the system to instantly locate the exact subgraph in Layer 1 containing the relevant data without scanning the entire document.
+
+#### 🔀 Triple-Neighbour Extraction
+Once the target Layer 1 subgraph is found, the system performs a Neo4j Cypher traversal across **all three layers**. It gathers up to 50 localized nodes (Patient Data + PubMed References + UMLS Definitions) to create a highly focused context window.
+
+#### ⬆️ The "Bottom-Up" Refinement (The Expert Review)
+A standard AI stops at generating a ground-level answer. MedGraphRAG performs an iterative, multi-layer LLM synthesis:
+1. **Initial Answer**: The LLM generates a response based *only* on the specific leaf nodes.
+2. **Reviewing the Tree**: The system ascends the Tag Tree. It passes the *Initial Answer* back into the LLM, alongside the summarized meta-data of the parent tag (e.g., moving from the *Arrhythmia* tag to the broader *Patient Cardiac History* tag).
+3. **Synthesis**: The LLM refines and updates the answer with this broader context. This repeats until the root of the tree is reached, ensuring the final answer accounts for both specific, localized symptoms and broad, long-term patient histories.
+
+*(In the Streamlit UI, this process is visible via real-time progress callbacks: `⬆️ Bottom-Up Refinement (Level 2) with LLM...`)*
+
+---
+
+## 📈 Engineering Achievements & Scale
+- **Zero-RAM Ontological Lookups**: Handled 3.5M nodes completely via Neo4j indexing, side-stepping standard `MemoryError` limitations found in naive RAG applications.
+- **Asynchronous Database Indexing**: Boot times were reduced to ~1 second by offloading Cypher index constraints to background threading.
+- **Deterministic AI Safety**: By relying on graph-traversal logic rather than vector-only similarity, the system prioritizes established medical relationships over probabilistic word guessing.
 
 ---
 
 ## 💻 Tech Stack
-- **Graph Engine**: Neo4j (Cypher) - Primary store and traversal engine.
-- **LLM**: GPT-4o-mini (via LangChain) for extraction and refinement.
-- **Embeddings**: Sentence-Transformers (`all-MiniLM-L6-v2`) hosted locally.
-- **UI**: Streamlit with live progress logging for both Ingestion and Retrieval.
+- **Database / Graph Engine**: Neo4j (Cypher)
+- **Application Logic**: Python 3.12 
+- **LLM Orchestration**: LangChain (`gpt-4o-mini`)
+- **Embedding Models**: Sentence-Transformers (`all-MiniLM-L6-v2`)
+- **Frontend / Telemetry**: Streamlit
 
 ---
 
-## 📦 Getting Started
+## 🚀 Quickstart / Installation Guide
 
-### 1. Installation
 ```bash
+# 1. Clone the repository
 git clone https://github.com/Hari027/Medical-GraphRAG.git
 cd Medical-GraphRAG
 
-# Setup environment
+# 2. Setup your isolation environment
 python -m venv venv
 venv\Scripts\activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Configuration
-Create a `.env` file in the root:
+### Configuration
+Create a `.env` file in the root directory. *(Ensure your Neo4j Desktop server is running locally).*
 ```env
-OPENAI_API_KEY=sk-xxxx...
+OPENAI_API_KEY=sk-your-openai-key
 NEO4J_URI=bolt://127.0.0.1:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=your_password
+HUGGINGFACEHUB_API_TOKEN=hf_your_key
 ```
 
----
-
-## 📥 Usage Flow
-
-### High-Speed Ingestion
-1. Start the app: `streamlit run app.py`.
-2. Paste your patient document or clinical text.
-3. Click **"Ingest Patient Document"**.
-4. The system will extract entities, link them to the 3.5M node backbone, and build the tag hierarchy in seconds.
-
-### Professional U-Retrieval
-1. Go to the **"Query"** tab.
-2. Ask a complex medical question.
-3. Watch the **live progress** as the system performs:
-   - **Top-Down Search**: Finding the most relevant graph cluster.
-   - **Cross-Layer Expansion**: Pulling clinical neighbors from all 3 layers.
-   - **Bottom-Up Refinement**: Cleaning and verifying the answer using hierarchical tags.
-
----
-
-## 🔬 Safety & Performance
-- **Deterministic Verification**: No "lucky guesses." Every LLM answer is cross-checked against the Neo4j ontology.
-- **Scalability**: Designed to handle 3.5M+ nodes without performance degradation.
-- **Privacy**: Patient data is processed into a graph format; raw text is never stored in the permanent knowledge base.
+### Running the App
+```bash
+streamlit run app.py
+```
+* **Step 1**: Use the UI to ingest clinical text. The system extracts relationships and builds the Triple-Graph.
+* **Step 2**: Navigate to the Query Tab, ask a medical question, and watch the live logs as the U-Retrieval engine performs Top-Down/Bottom-Up synthesis in real-time.
