@@ -1,0 +1,265 @@
+%%
+%% Elsevier CAS Template Version
+%% Converted from IEEE format without changing content
+%%
+
+\documentclass[a4paper,fleqn]{cas-sc}
+
+\usepackage[authoryear,longnamesfirst]{natbib}
+\usepackage{float}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{url}
+\usepackage{placeins}
+\begin{document}
+\setcounter{topnumber}{4}
+\setcounter{bottomnumber}{4}
+\setcounter{totalnumber}{8}
+\renewcommand{\topfraction}{0.95}
+\renewcommand{\bottomfraction}{0.95}
+\renewcommand{\textfraction}{0.05}
+\renewcommand{\floatpagefraction}{0.50}
+\floatplacement{figure}{t}
+\let\WriteBookmarks\relax
+\def\floatpagepagefraction{1}
+\def\textpagefraction{.001}
+
+\shorttitle{Optimised MedGraphRAG Architecture}
+\shortauthors{Nandhan et al.}
+
+\title [mode = title]{An Optimised MedGraphRAG Architecture:\\
+Lightweight Triple Graph and U-Retrieval\\
+Implementation with Gemma 31B}
+
+\author[1]{M. Hari Nandhan}
+\ead{harinandhan27@gmail.com}
+
+\author[1]{Richa Yanamandra}
+\ead{richa.yanamandra@gmail.com}
+
+\author[1]{Geetanjali Singh}
+\ead{info.geet2412@gmail.com}
+
+\cormark[1]
+
+\affiliation[1]{
+    organization={Bennett University},
+    addressline={School of Computer Science},
+    city={Noida},
+    state={India},
+    country={India}
+}
+
+\cortext[1]{Corresponding author}
+
+\begin{abstract}
+LLMs show impressive generalization ability in medical text processing, but often hallucinate and generate untrustworthy responses in critical clinical contexts. This issue is addressed by RAG, but traditional vector-based RAG fails to provide sufficient relational richness for complex clinical reasoning. Here we present a refined and compact version of MedGraphRAG for local consumer devices. Following the original framework of MedGraphRAG \cite{wu2024medgraphrag}, the proposed methodology improves the MedGraphRAG pipeline with architectural modifications to enable more reliable graph retrieval. First, instead of employing the regular cosine cutoff strategy, we adopt an \textbf{argmax mapping approach} for cross-layer linkages, which reduces database bloating and saves computation resources. We further ground the knowledge graph with PubMed articles. With Gemma 31B \cite{gemma2024} and SapBERT \cite{liu2021sapbert} running locally, the pipeline is tested on the USMLE MedQA benchmark \cite{jin2021medqa}. The proposed pipeline boosts performance from 83.0\% in zero-shot evaluation to \textbf{89.3\%}.
+\end{abstract}
+
+\begin{highlights}
+\item Lightweight MedGraphRAG pipeline for local deployment
+\item Strict argmax mapping reduces graph noise and computation overhead
+\item Proposed pipeline achieves 89.3\% accuracy on MedQA-USMLE
+\end{highlights}
+
+\begin{keywords}
+MedGraphRAG \sep Retrieval-Augmented Generation \sep Medical LLMs \sep Knowledge Graphs \sep Gemma 31B
+\end{keywords}
+
+\maketitle
+
+% ---------------------------------------------------------------
+\section{Introduction}
+% ---------------------------------------------------------------
+Medical text mining constitutes an essential application in today's world of healthcare, involving everything from clinical summarization and electronic health records processing to advanced medical question answering systems. Automatic information retrieval and processing in the field of medicine seek to assist in clinical decision-making processes and facilitate evidence-based research.
+
+However, the deployment of LLMs to solve these practical problems in healthcare encounters several core issues. First, the amount of biomedical knowledge available is large, very specialized, and constantly evolving. In contrast, existing LLMs can be considered static after their training. Fine-tuning of model parameters entails substantial cost, while embedding all biomedical encyclopedias within a bounded context window architecture proves to be technically difficult \cite{wu2024medgraphrag}. Second, medicine is an inherently high-stakes field, where accuracy and verifiability of terminology matter most. Generating false information about drug interactions or misquoting critical diagnostic guidelines can be extremely dangerous for patient safety, as demonstrated in several studies examining medical shortcomings of state-of-the-art models \cite{singhal2023medpalm2,saab2024gemini,wang2023prompt,savage2024diagnostic}. Third, proprietary nature of modern LLMs and reliance on cloud technology pose important ethical and regulatory risks to the storage of sensitive patient data \cite{wu2024medgraphrag,miao2024integrating}.
+
+Retrieval-Augmented Generation (RAG) \cite{lewis2021rag} has emerged as a promising technique to partially address these issues by fetching external documents at inference time, thereby grounding the model's responses to verifiable external knowledge. However, standard RAG systems, which generally depend on a flat vector similarity search (e.g., matching a query embedding against a database of document chunks), fails to capture the complex relational structure of medical knowledge. In clinical reasoning, a drug entity must be linked to its mechanism of action, its contraindications, and relevant vocabulary definitions simultaneously. A flat vector search often retrieves fragmented or superficially similar but clinically unrelated texts.
+
+To resolve this, Graph-based RAG (GraphRAG) \cite{edge2024graphrag} builds a knowledge graph from raw documents and queries it for better, interconnected context. While effective for holistic question answering over corporate data, its standard community-detection construction is computationally very expensive and misses the specificity needed for medicine. Recently, Wu et al.\ \cite{wu2024medgraphrag} introduced MedGraphRAG, adapting GraphRAG to the medical domain through Triple Graph Construction and U-Retrieval. Whilst highly effective, their original framework relies majorly on closed-source APIs and computationally unbounded dense thresholding for graph construction, which is not practical for privacy-preserving local deployment.
+
+In this work, we propose a optimized, lightweight \textbf{MedGraphRAG} pipeline made to solve the scalability and noise issues of existing medical graph frameworks. While structurally adopting the original triple-layer approach, the proposed pipeline introduces critical original modifications to make local inference precise. The specific objective is to assess whether the proposed architectural design can enhance the reasoning skills of the open-weights model powered by consumer-grade computing equipment to the point where it can compete against bigger, proprietary models.
+The contributions and key architectural modifications are as follows:
+\begin{itemize}
+    \item We design and build the optimised pipeline utilising only locally-hosted, open-weights models (Gemma 31B \cite{gemma2024} and SapBERT \cite{liu2021sapbert}), thereby sidestepping the use of any proprietary cloud-based API systems.
+    \item We create Layer 2 from reputable PubMed sources, ensuring that the model is built on a firm foundation of evidence for reasoning.
+    \item Instead of the typical dense cosine similarity filtering method employed between Layer 2 and Layer 3, we utilise the much stricter \textbf{argmax mapping} approach. This lowers the computational overhead, lessens the clutter in the database graph, and necessitates a one-to-one mapping of definitions semantically.
+    \item We test the model using 1{,}273 United States Medical Licensing Examination (USMLE) MedQA questions \cite{jin2021medqa} and attain an accuracy of 89.3 which is higher than the accuracy of the model without the pipeline.
+\end{itemize}
+
+% ---------------------------------------------------------------
+\section{Background and Related Work}
+% ---------------------------------------------------------------
+
+\subsection{Large Language Models in Medicine}
+The application of LLMs to medicine has accelerated rapidly. Early efforts focused on pre-training language models on biomedical corpora, yielding models such as BioBERT \cite{lee2020biobert}, PubMedBERT \cite{gu2021pubmedbert}, and BioGPT \cite{luo2022biogpt}. As the scale of foundation models grew, researchers shifted to instruction fine-tuning base models on clinical data. Notable examples include PMC-LLaMA \cite{wu2023pmcllama}, BioMedLM \cite{bolton2022biomedlm}, and ClinicalCamel \cite{toma2023clinicalcamel}. At the frontier, Google's Med-PaLM 2 \cite{singhal2023medpalm2} and Med-Gemini \cite{saab2024gemini} achieve state-of-the-art results on medical benchmarks by leveraging massive scale and rigorous human-expert tuning. However, the resources required to train and update these models are prohibitively large, thus making their practical application almost impossible. In contrast, our research takes the exact opposite approach and aims at enhancing the reasoning skills of existing open-weights models such as Gemma \cite{gemma2024} and LLaMA \cite{touvron2023llama}.
+
+\subsection{Retrieval-Augmented Generation (RAG)}
+RAG, formalized by Lewis et al.\ \cite{lewis2021rag}, circumvents the static memory limitations of LLMs by retrieving relevant passages from a data-store to condition generation. Subsequent research has heavily focused on dense retrieval methods (e.g., DPR \cite{karpukhin2020dpr}) and hybrid retrieval combining dense vectors with BM25 lexical matching \cite{robertson1994bm25}. RAG has been shown to greatly decrease hallucinations and improve factual accuracy \cite{gao2023enabling,qi2024model,shuster2021retrieval}. In the medical domain, RAG has been explored for clinical decision support and fact-checking \cite{xiong2024benchmarking,long2024bailicai}. However, standard flat RAG treats documents as isolated snippets, failing to capture the rich semantic relationships inherent in medical pathology.
+
+\subsection{Graph-Augmented Retrieval}
+The way to make the structure visible in RAG is to rely on Knowledge Graphs (KGs). First efforts relied on entity-to-graph matching techniques, such as QA-GNN \cite{yasunaga2021qagnn} and Greaselm \cite{zhang2022greaselm}. In February 2024, Microsoft introduced GraphRAG \cite{edge2024graphrag}, a new approach based on extraction of entities and relations by an LLM and clustering those into communities according to Leiden community detection. The generated summaries can then be used on questions about the whole corpus. Although powerful, it does not reach the level of ontology that is needed in medicine. There are other variations, such as GRAG \cite{hu2024grag} and G-Retriever \cite{he2024gretriever}, which try to unite text and structure. MedGraphRAG \cite{wu2024medgraphrag} is a step further in that direction for healthcare applications.
+
+\subsection{Biomedical Ontologies and Embeddings}
+The approach is deeply dependent on biomedical standards. UMLS \cite{bodenreider2004umls} contains a very detailed ontology which maps millions of biomedical terms into standard Concept Unique Identifiers (CUIs). In order to perform the semantic linking of terms with concepts from the CUI ontology, we need to represent text in the same vector space as the biomedical terminology. To this end, we use SapBERT \cite{liu2021sapbert} - a version of BERT fine-tuned via contrastive learning to map UMLS synonyms into similar vector spaces.
+
+% ---------------------------------------------------------------
+\section{Proposed Methodology}
+% ---------------------------------------------------------------
+
+The implementation of the proposed architecture, closely mapped to the engineered workflow pipeline, follows a two-phase architecture. This two phase architecture consists of a nine step Ingestion Pipeline for knowledge graph creation, and a six step Retrieval Pipeline for query answering system. The detail of each phase is given in the following subsections:
+
+\subsection{Phase 1: Ingestion Pipeline}
+\textcolor{red}{The ingestion pipeline is designed to systematically transform unstructured clinical documents into a structured, interconnected knowledge graph. This offline process operates through a sequence of semantic text chunking, entity extraction, and multi-layer graph construction, ultimately generating a hierarchical tag tree that facilitates efficient downstream retrieval.}
+\subsubsection{Step 1 --- Input Ingestion \& Step 2 --- Semantic Chunking}
+The clinical text data are processed for ingestion in chunks $H_j$ that are semantically cohesive. The chunks are of length 1,200 characters with an overlap of 150 characters per chunk.
+\begin{equation}
+H_j = \begin{cases}
+H_{j-1} \cup \{P_j\} & \text{if } L^G_\text{sem}=\text{True} \text{ and } T_{\text{total}} \le \text{Max}(L^G) \\
+\{P_j\} & \text{otherwise}
+\end{cases}
+\end{equation}
+where $T_{\text{total}}$ is the cumulative token count of the merged chunk.
+
+\subsubsection{Step 3 --- Entity Extraction \& Step 4 --- Relationship Extraction}
+In parallel with each chunk, the LLM identifies structured entities of clinical relevance (classified into diseases, drugs, and symptoms) together with their directed relationships.
+\subsubsection{Step 5 --- Graph Construction}
+The first step of Meta-MedGraph creation begins for each chunk. This is where we conduct the triple linkage between Layer-1 entities (from the user's document), Layer-2 entities (from the PubMed articles), and Layer-3 entities (from UMLS).
+The \textbf{L1 $\rightarrow$ L2} reference edge set uses cosine similarity:
+\begin{equation}
+R^{e^1}_{e^2} = \left\{\, (e^1_i,\;\texttt{the\_ref\_of},\;e^2_j) \mid \text{sim}\bigl(\phi(C_{e^1_i}), \phi(C_{e^2_j})\bigr) \geq \delta_r \,\right\}
+\end{equation}
+The \textbf{L2 $\rightarrow$ L3} definition edge departs from standard thresholding. To prevent combinatorial edge explosion and massive database bloat, we employ a strict, GPU-accelerated \textbf{argmax search}. For every $e^2_j$, its single best-matching UMLS concept is:
+\begin{equation}
+e^{3*}_j = \arg\max_{e^3_k \in E^3}\;\phi(C_{e^2_j})^\top \phi(C_{e^3_k})
+\end{equation}
+By implementing a 1:1 mapping, we minimized system load and ensured that each piece of PubMed evidence is anchored to exactly one definitive medical concept.
+\begin{figure*}[!h]
+    \centering
+    \includegraphics[width=\textwidth]{architecture.png}
+    \caption{System architecture of the optimised MedGraphRAG pipeline. Phase 1 (top) details the parallel entity and relationship extraction leading into tag tree construction. Phase 2 (bottom) outlines the retrieval process, explicitly highlighting the core architectural contribution: the Strict Argmax 1:1 Mapping between Layer 2 (PubMed Evidence) and Layer 3 (UMLS Definitions) designed to prune dense semantic noise before final context formation}
+    \label{fig:architecture}
+\end{figure*}
+
+\FloatBarrier
+
+\subsubsection{Step 6 --- Graph Merging}
+The isolated, chunk-level Meta-MedGraphs are semantically compared and merged to form a combined graph that understands cross-chunk references.
+
+\subsubsection{Step 7 --- Tag Generation \& Step 8 --- Tag Tree Construction}
+For each merged graph, the LLM generates a structured tag dictionary $T_m$ over predefined medical categories. These graphs are then iteratively aggregated into a hierarchical tag tree (hierarchical summaries). Pairs of graphs are merged if their average pairwise tag similarity exceeds a threshold $\delta_t$:
+\begin{equation}
+\text{sim}(G_{m_i}, G_{m_j}) = \frac{1}{|T_{m_i}||T_{m_j}|} \sum_{t \in T_{m_i}} \sum_{t' \in T_{m_j}} \text{sim}\bigl(\phi(t), \phi(t')\bigr)
+\end{equation}
+
+\subsubsection{Step 9 --- Storage in Neo4j Graph Database}
+The complete Triple Graph and its overlaying Tag Tree are persistent in a Neo4j Graph Database \cite{neo4j}.
+
+\subsection{Phase 2: Retrieval Pipeline}
+\textcolor{red}{The retrieval pipeline dynamically queries the pre-computed Meta-MedGraph to extract the most clinically relevant evidence for a given question. Operating at inference time, it executes a top-down traversal through the hierarchical tag tree to filter semantic noise, followed by a targeted retrieval of interconnected graph structures and a semantic re-ranking to form a highly specific context block for the LLM.}
+\subsubsection{Step 1 --- Query Processing \& Step 2 --- Top-Down Traversal}
+The user's query $Q$ is converted into an embedding vector. Starting from the root of the Tag Tree, the system greedily traverses by selecting the most similar tag node at each level for a pre-defined number of \textbf{hops} (e.g., 2-hop or 3-hop traversal), rather than completely going down to a leaf node:
+\begin{equation}
+T_{i+1} = \arg\max_{T_i[j] \in T_i}\;\text{sim}(T_Q, T_i[j])
+\end{equation}
+By restricting the traversal depth via hop-constraints, we prevent the context from becoming too narrow or prematurely filtering out relevant cross-domain Meta-MedGraphs.
+
+\subsubsection{Step 3 --- Graph Retrieval}
+At the terminal node of the hop-constrained traversal, we retrieve the interconnected graph structure traversing Layer 1 (Meta-MedGraph nodes), Layer 2 (Connected PubMed nodes), and Layer 3 (Connected UMLS nodes).
+
+\subsubsection{Step 4 --- Context Formation}
+The $k$-hop neighbourhood of the retrieved entities is collected to form a rich context block (triplets and neighboring nodes). Candidate neighbours $n$ are semantically re-ranked to prevent overflow:
+\begin{equation}
+\text{score}(n) = \text{sim}\bigl(\phi(Q), \phi(n)\bigr), \quad E_{k,r} = \text{Top-}50\bigl(\text{score}(\cdot)\bigr)
+\end{equation}
+
+\subsubsection{Step 5 --- Bottom-Up Refinement \& Step 6 --- Final LLM Response}
+The LLM traverses back up the Tag Tree to merge broader summaries, re-grounding the highly specific context within the global clinical picture. This final retrieved graph context and tag summaries are provided to the LLM to generate the final, evidence-grounded answer.
+
+% ---------------------------------------------------------------
+\section{Implementation Details}
+% ---------------------------------------------------------------
+
+\subsection{Hardware and Infrastructure Setup}
+In order to test the hypothesis of MedGraphRAG being deployable in resource-restricted or privacy-preserving contexts, all experiments have been performed using one consumer-level computer with an NVIDIA RTX GPU. The LLM reasoning engine, Gemma 31B \cite{gemma2024}, has been run locally through the Ollama framework \cite{ollama2024} under 4-bit quantisation constraints due to VRAM limitations. The graph database has been set up locally using the Neo4j Community Edition \cite{neo4j} storing all nodes and edges of Layer 1, Layer 2, and Layer 3. The cross-layer GPU linking has been done using PyTorch \cite{pytorch2019} along with CUDA. Importantly, no API requests have been made to OpenAI, Google, or Anthropic in any benchmarking setting, ensuring the independence of the whole pipeline and its deployability in the context of hospitals where PHI cannot go outside the internal network. The baseline condition runs Gemma 31B with zero-shot prompting and no retrieved context, directly processing each question.
+
+\subsection{Embedding Model}
+Whereas the MedGraphRAG paper \cite{wu2024medgraphrag} employed OpenAI's \texttt{text-embedding-3-large}, to abide by the local-only requirement, we opted for \textbf{SapBERT} \cite{liu2021sapbert} instead. SapBERT is a 768-dimension biomedical language model pre-trained using self-alignment with UMLS synonyms. Not only does it allow us to bypass cloud embedding cost and latency, it offers significantly better results on biomedical named entity normalisation than generic embeddings.
+
+\subsection{Repository Data Curation}
+The contents of layer 2 of the graph were created through querying PubMed Entrez API \cite{ncbi2024entrez} for abstracts that are pertinent to clinical domains covered by the benchmark. The content of abstracts will serve as a source of evidential support (for example, recent clinical studies or pathophysiological investigations). The initial set of nodes in layer 3 was extracted directly from UMLS Metathesaurus \cite{bodenreider2004umls} through querying the UMLS REST API with the goal of persisting relevant medical concepts as Entity nodes. Cross-layer edges (\texttt{the\_reference\_of} and \texttt{the\_definition\_of} links) were calculated offline as part of the GPU-based batched matrix multiplication linkage process and stored as \texttt{LINK} relations within the Neo4j graph database.
+
+% ---------------------------------------------------------------
+\section{Experiments and Results}
+% ---------------------------------------------------------------
+
+\subsection{Dataset}
+We evaluate the proposed architecture on \textbf{MedQA-USMLE} \cite{jin2021medqa}, a widely-used benchmark of 1{,}273 four-option multiple-choice questions drawn from United States Medical Licensing Examination Step 1, 2, and 3. Questions span clinical reasoning, pharmacology, pathophysiology, epidemiology and biostatistics.
+
+\subsection{Evaluation Protocol}
+We run each question through the full MedGraphRAG pipeline. The predicted answer is extracted by parsing the LLM's final output for the first occurrence of a letter (A/B/C/D/E). We report exact-match accuracy against ground-truth labels. We do not use few-shot prompting; all evaluations are zero-shot.
+
+\subsection{Results}
+
+\begin{table}[!t]
+\centering
+\caption{Accuracy on MedQA-USMLE (1{,}273 questions)}
+\label{tab:results}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Configuration} & \textbf{Correct} & \textbf{Accuracy} \\ \midrule
+Meditron 70B \cite{maharjan2024} & 894 & 70.2\% \\
+Mixtral 8x7B \cite{maharjan2024} & 913 & 71.7\% \\
+Yi 34B (Ensemble) \cite{maharjan2024} & 924 & 72.6\% \\
+Gemma 31B --- No Retrieval & 1,056 & 83.0\% \\
+Claude 4.1 Opus \cite{faithful2026} & 1,095 & 86.0\% \\
+GPT-4 (Zero-shot) \cite{agent2026} & 1,096 & 86.1\% \\
+GPT-4.1 (Baseline) \cite{benchmarking2026} & 1,100 & 86.4\% \\
+Med-PaLM 2 \cite{singhal2023medpalm2} & 1,101 & 86.5\% \\ \midrule
+Gemma 31B + MedGraphRAG (Proposed) & \textbf{1,136} & \textbf{89.3\%} \\ \midrule
+\textbf{Absolute Gain} & +80 & \textbf{+6.3\%} \\ \bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:results} summarises the main result of the proposed architecture. The triple-graph pipeline provides a consistent +6.3\% absolute accuracy improvement. This is competitive with gains reported by Wu et al.\ \cite{wu2024medgraphrag} across models of similar size (GPT-4 gains ranged from $\sim$3--13\% depending on benchmark).
+
+
+% ---------------------------------------------------------------
+\section{Discussion}
+% ---------------------------------------------------------------
+\textcolor{red}{This section examines the architectural decisions and outcomes of the proposed MedGraphRAG framework. We analyze the qualitative impact of triple-graph linking on the reasoning capabilities of the LLM, evaluate the noise-reduction benefits of U-Retrieval compared to traditional flat vector search, and discuss the computational advantages of implementing strict argmax constraints during graph construction.}
+\subsection{The Impact of Triple Linking on Clinical Reasoning}
+From the experimental results, it can be noted that the architectural aspect which drives the increase in accuracy is the structured triple $[\text{RAG entity},\; \text{source},\; \text{definition}]$. When faced with complicated queries that demand pathophysiological or pharmacological reasoning in multiple steps, the LLM tends to resort to heuristic relations. Here, by tying down the query context to Layer 2 (articles from PubMed) and Layer 3 (UMLS definitions), the LLM's reasoning becomes grounded. Layer 2 provides mechanism-level evidence from the real world, whereas the constraint imposed by Layer 3 ensures that the generation process by the LLM is bound by standardized medical terminologies.
+
+\subsection{U-Retrieval vs. Flat Vector Retrieval}
+The inevitable presence of noise in a flat retrieval over Layer-1 chunks across an extensive corpus means that more than one chunk might match the input question based on their semantic embedding even though none of them will possess the necessary clinical nuance to qualify for retrieval. To address this problem, U-Retrieval incorporates the idea of the tag tree so that all retrievals start with a semantically verified subgraph. Through a hierarchical filtering using Tag Tree, candidates get pruned even before entity-level cosine scoring can be performed. Moreover, this technique allows the model to retain focus on the broader clinical picture. As a result of re-grounding the very specific answer in the globally abstracted summaries of the patient, it avoids ``tunnel vision'' on one piece of data in particular, especially in cases where the patient is affected by conditions belonging to different clinical spheres.
+
+\subsection{Edge Constraints and the Argmax Strategy}
+One of the key aspects of the approach lies in employing an argmax constraint when making connections from Layer 2 to Layer 3. As per the preliminary experiments, using a rigid threshold value (for example, 0.45 like was done by default \cite{wu2024medgraphrag}) would result in a massive increase in cross-layer edges, essentially creating a situation where any symptom would be linked to numerous barely relevant disease nodes. Such combinatorial bloat would overload the Neo4j database and fill the retrieval context with too many noisy terms. Through implementing the argmax constraint, we effectively limit the number of cross-layer connections to one single 1:1 connection, ensuring each term of Layer 2 has a strict single semantic link to the corresponding UMLS definition. Not only does such a modification save system resources and significantly decrease memory overhead, but it also improves the signal/noise ratio of the retrieved context. In regard to the reference connections between Layers 1 and 2, we increased $\delta_r$ to 0.55.
+\subsection{Error Analysis}
+\textcolor{red}{Despite the substantial gains achieved by the proposed pipeline, a detailed examination of the model's failures reveals intrinsic limitations in the current retrieval methodology. An analysis of the 137 incorrect responses from the MedQA evaluation highlights three primary failure points, which concurrently serve as areas for future refinement:}
+
+\textbf{Retrieval Noises.} Biostatistics and epidemiology (e.g.\ measurement bias and lead-time bias) questions fail since Layer-2 retrieval retrieves clinically-related trial articles instead of the methodological definition of the term. The SapBERT embedding space has a tendency to group them around the ``trial'' query term.
+
+\textbf{Negative-Constraint Questions.} In the case of USMLE ``EXCEPT'' questions, the LLM tends to disregard the negative constraint. The graph-retrieved lists of diseases associated with certain conditions increase the likelihood of picking up an associated disease than the sole exception in this category of question types.
+
+\textbf{Image-Based Questions.} There are some MedQA questions that refer to exhibit images (e.g.\ ``the structure indicated by the green arrow''). The pipeline is strictly textual, so the absence of any visual clues leads to the answer being selected on pure chance.
+
+% ---------------------------------------------------------------
+\section{Conclusion and Future Work}
+% ---------------------------------------------------------------
+
+For this study, we developed and tested a MedGraphRAG architecture that is optimized for efficiency and weight on the USMLE MedQA challenge dataset. We enforced a strict mapping rule using the argmax function and set high similarity values. These strategies allowed us to build a very sparse and restricted knowledge graph. This approach ensured the avoidance of database bloating and minimized retrieval noise. Even with a sparse graph and the implementation of a complete local hardware stack (Gemma 31B and Neo4j), the proposed pipeline managed to achieve a staggering 89.3\% accuracy rate. This was a 6.3 percentage point increase from the zero-shot baseline. We demonstrated that even with sparse graphs there can be a significant improvement in an LLM's performance.\\
+     In future research, efforts will be concentrated on the implementation of the BM25 \cite{robertson1994bm25} hybrid search component along with the SapBERT dense representation for enhancing the recall rate in case of keyword-based queries (e.g., accurate genetic markers or statistical concepts). Moreover, we plan to analyze the benefits of supervised fine-tuning Gemma 31B on MedQA train datasets.
+
+% ---------------------------------------------------------------
+\bibliographystyle{cas-model2-names}
+\bibliography{references}
+
+\end{document}

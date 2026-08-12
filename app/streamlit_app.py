@@ -4,15 +4,21 @@ load_dotenv()
 os.environ["USER_AGENT"] = "MedGraphRAG/1.0"
 
 import json
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import streamlit as st
 import streamlit.components.v1 as components
 from pyvis.network import Network
-from medical_terms import get_medical_terms
+from medgraphrag.medical_terms import get_medical_terms
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_openai import ChatOpenAI
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import ChatOllama
 
-from med_graph_rag import MedGraphRAG, MEDICAL_TAGS
+
+from medgraphrag.pipeline import MedGraphRAG, MEDICAL_TAGS
 
 # -------------------------------------------------------------------------
 # Page config
@@ -164,13 +170,14 @@ neo4j_uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
 neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
 neo4j_pass = os.environ.get("NEO4J_PASSWORD", "password")
 
-if not api_key:
-    st.error("⚠️  Set OPENAI_API_KEY in your .env file.")
-    st.stop()
+# API key check removed for local Ollama usage
 
 if "med_rag" not in st.session_state:
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
-    embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    llm = ChatOllama(model="gemma4:31b-cloud", format="json", temperature=0)
+    embedder = HuggingFaceEmbeddings(
+        model_name="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        encode_kwargs={"normalize_embeddings": True},
+    )
     neo4j_creds = {
         "uri": neo4j_uri,
         "user": neo4j_user,

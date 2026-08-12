@@ -1,0 +1,73 @@
+1. Title Page
+Title of the Topic: Evaluating an Optimised MedGraphRAG Architecture for Safe Medical AI
+Subject Name: CSET431 – Special Topics in Computer Engineering 
+Student Name: M.Hari Nandhan
+Roll Number: [Enter Roll Number Here]
+Faculty Mentor Name: Dr. Geetanjali Singh
+School Name: School of Computer Science, Bennett University
+
+--------------------------------------------------
+
+2. Abstract
+This report provides an overview of the implementation and evaluation of a lightweight Medical Graph Retrieval-Augmented Generation (MedGraphRAG) architecture. The primary purpose of this study is to explore how to enhance the clinical reasoning capabilities of open-weights Large Language Models (LLMs) running on consumer-grade hardware without relying on closed-source, cloud-based APIs. The literature shows that while standard RAG mitigates hallucinations, it lacks relational depth, and standard GraphRAG is computationally expensive for the medical domain. By applying strict argmax mapping and utilizing SapBERT for cross-layer semantic linking, this study achieved an 89.3% accuracy on the USMLE MedQA benchmark using a local Gemma 31B model. The technologies discussed include Neo4j for graph storage, Gemma 31B for reasoning, PyTorch for GPU linking, and SapBERT for biomedical entity normalization.
+
+--------------------------------------------------
+
+3. Introduction
+Background: The rapid growth of Large Language Models (LLMs) has fundamentally changed natural language processing. However, deploying these models in healthcare requires absolute precision and strict data privacy, which standard models struggle to guarantee.
+Importance: Ensuring patient safety means medical AI must rely on verifiable facts rather than internal parametric memory to prevent hallucinations.
+Problem Statement: Standard vector RAG retrieves fragmented text, failing to capture the complex relational structure of medical knowledge. Conversely, existing GraphRAG solutions are computationally unbounded and rely on privacy-violating cloud APIs.
+Objective: To review the literature on graph-based RAG and demonstrate how a highly constrained, lightweight triple-graph architecture can achieve expert-level clinical reasoning locally.
+
+--------------------------------------------------
+
+4. Overview of the Topic / Technology
+Explanation: MedGraphRAG is an advanced retrieval system that organizes raw medical documents into a structured knowledge graph, connecting user documents to medical literature and standardized vocabularies.
+Working Principle: It utilizes a "U-Retrieval" process involving a top-down traversal of a hierarchical tag tree to find relevant context, followed by a bottom-up refinement to summarize the global clinical picture.
+Architecture: The system uses a Three-Layer Triple Graph: Layer 1 (Meta-MedGraphs of user documents), Layer 2 (PubMed Evidence), and Layer 3 (UMLS Definitions). An argmax strategy is used to strictly map Layer 2 evidence to Layer 3 definitions, creating a sparse, highly accurate graph.
+Real-World Applications: Privacy-preserving clinical decision support, local medical question answering, and automated verifiable diagnostic reasoning in hospitals.
+
+--------------------------------------------------
+
+5. Literature Review
+
+Author        Year    Methodology                                      Key Findings
+-----------------------------------------------------------------------------------------------------------------
+Wu et al.     2024    MedGraphRAG: 3-layer triple graph & U-Retrieval  Graph-based RAG significantly improves medical QA over flat RAG; reliance on GPT-4 noted.
+Edge et al.   2024    GraphRAG: Leiden community detection             Global summarization over graphs works well for corporate data but is too expensive/generic for medicine.
+Singhal et al.2023    Med-PaLM 2: Instruction fine-tuning              Achieves state-of-the-art on USMLE but requires astronomical compute and cloud infrastructure.
+Lewis et al.  2021    RAG: Dense passage retrieval generation          Standard RAG significantly reduces hallucination, but treats documents as isolated snippets.
+Liu et al.    2021    SapBERT: Self-alignment pretraining on UMLS      Provides superior representation for biomedical entity normalization compared to standard BERT.
+
+--------------------------------------------------
+
+6. New Technologies / Trends
+Latest Advancements: The shift towards local, open-weights foundation models capable of reasoning at expert levels when grounded by external graphs (e.g., Gemma 31B).
+Tools & Frameworks: 
+- Neo4j (Graph Database)
+- PyTorch with CUDA (GPU-accelerated tensor linking)
+- Ollama (Local LLM serving with 4-bit quantisation)
+- SapBERT (Biomedical dense embeddings)
+Industry Adoption: Healthcare providers are increasingly seeking "on-premise" LLM deployments to comply with HIPAA and PHI regulations, making local GraphRAG highly desirable.
+
+--------------------------------------------------
+
+7. Research Gap
+Limitations in Existing Research: Current Layer-2 retrieval is heavily biased toward recent PubMed abstracts, which may omit fundamental, textbook pathophysiological rules required for general medical exams.
+Problems Not Yet Solved: The system struggles with non-evidentiary questions (like ethics, epidemiology, or biostatistics) because the graph is purely evidence-focused rather than methodology-focused. Visual (image-dependent) clinical questions remain completely unsolved by text-only graph pipelines.
+Scope for Improvement: Implementing dynamic tag-tree traversal depths, adding a BM25 hybrid retrieval stage for exact keyword matching, and optimizing the offline cross-layer linking with Approximate Nearest Neighbor (ANN) algorithms like FAISS.
+
+--------------------------------------------------
+
+8. Advantages and Disadvantages
+
+✔ Pros:
+- Achieves high clinical reasoning accuracy (89.3% on USMLE) without relying on commercial cloud APIs.
+- 100% local operation, ensuring complete data privacy (safe for PHI).
+- The argmax mapping strategy prevents database bloat and drastically reduces retrieval noise.
+- Forces the LLM to anchor its answers to real-world medical evidence and standard UMLS terminology.
+
+✖ Cons:
+- Purely text-based, meaning it fails completely on image-based medical questions.
+- High initial compute cost for the offline entity extraction and cross-layer GPU linking phase.
+- Does not natively handle "negative constraint" questions (e.g., "EXCEPT") well, as retrieved associations can confuse the model.

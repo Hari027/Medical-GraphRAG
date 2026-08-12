@@ -12,9 +12,9 @@ import numpy as np
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from data_models import Entity, Relationship, MetaMedGraph, MEDICAL_TAGS, BUILTIN_VOCAB
-from api_clients import UMLSClient, Neo4jClient, PubMedClient
-from llm_helpers import (
+from medgraphrag.models import Entity, Relationship, MetaMedGraph, MEDICAL_TAGS, BUILTIN_VOCAB
+from medgraphrag.clients import UMLSClient, Neo4jClient, PubMedClient
+from medgraphrag.llm import (
     EmbeddingStore, 
     _call_llm_json, 
     _extract_entities, 
@@ -37,11 +37,12 @@ class MedGraphRAG:
     Cross-layer links are built by cosine-similarity thresholding.
     """
 
-    SIMILARITY_THRESHOLD = 0.45   # δr  — cross-layer linking threshold
+    SIMILARITY_THRESHOLD = 0.55   # δr  — cross-layer linking threshold (raised from 0.45 to filter noise)
     TAG_MERGE_THRESHOLD  = 0.60   # δt  — hierarchical tag clustering threshold
     TOP_N_ENTITIES       = 8      # Nu  — entities retrieved per query
-    TOP_K_NEIGHBOURS     = 2      # ku  — triple-neighbour hops
+    TOP_K_NEIGHBOURS     = 3      # ku  — triple-neighbour hops (3 needed: L1→L2 article→L2 MeSH→L3 UMLS)
     MAX_TRIPLE_NEIGHBORS = 50     # safety cap to avoid OpenAI 429 token limits
+    MAX_RERANK_POOL      = 120    # fetch this many candidates from Neo4j before re-ranking
     MAX_TAG_LAYERS       = 6      # max U-Retrieval layers
 
     def __init__(
@@ -312,7 +313,7 @@ class MedGraphRAG:
             for t_val in mg.tag_summary.values():
                 tag_embs.append(self.emb.embed(t_val))
             
-            centroid = np.mean(tag_embs, axis=0) if tag_embs else np.zeros(384)
+            centroid = np.mean(tag_embs, axis=0) if tag_embs else np.zeros(768)
             nodes.append({
                 "ids": [mg.graph_id],
                 "tags": mg.tag_summary,
@@ -493,18 +494,39 @@ class MedGraphRAG:
         top_entities = [e for _, e in scored[: self.TOP_N_ENTITIES]]
 
         if progress_callback: progress_callback(f"🔗 Gathering Triple Neighbors for {len(top_entities)} entities...")
-        # Gather triple neighbours (cross-layer)
-        triple_neighbours: list[Entity] = []
+        # Gather triple neighbours (cross-layer) — collect a large candidate pool
+        raw_neighbours: list[Entity] = []
         seen = {e.name for e in top_entities}
         for e in top_entities:
             for nb in self._get_triple_neighbours(e.name, self.TOP_K_NEIGHBOURS):
-                if len(triple_neighbours) >= self.MAX_TRIPLE_NEIGHBORS:
+                if len(raw_neighbours) >= self.MAX_RERANK_POOL:
                     break
                 if nb.name not in seen:
                     seen.add(nb.name)
-                    triple_neighbours.append(nb)
-            if len(triple_neighbours) >= self.MAX_TRIPLE_NEIGHBORS:
+                    raw_neighbours.append(nb)
+            if len(raw_neighbours) >= self.MAX_RERANK_POOL:
                 break
+
+        # ── Semantic Re-Ranking ──
+        # Re-rank all candidates by cosine similarity to the query
+        # so only the most relevant L2/L3 entities reach the LLM prompt.
+        if raw_neighbours:
+            if progress_callback: progress_callback(f"🎯 Re-ranking {len(raw_neighbours)} candidates by query relevance...")
+            nb_texts = [nb.name for nb in raw_neighbours]
+            nb_embeddings = self.emb.embed_batch(nb_texts)
+            scored_nbs = []
+            for nb, nb_emb in zip(raw_neighbours, nb_embeddings):
+                if nb_emb is not None:
+                    sim = float(np.dot(q_emb, nb_emb) / (
+                        np.linalg.norm(q_emb) * np.linalg.norm(nb_emb) + 1e-9
+                    ))
+                    scored_nbs.append((sim, nb))
+                else:
+                    scored_nbs.append((0.0, nb))
+            scored_nbs.sort(key=lambda x: x[0], reverse=True)
+            triple_neighbours = [nb for _, nb in scored_nbs[:self.MAX_TRIPLE_NEIGHBORS]]
+        else:
+            triple_neighbours = []
 
         if progress_callback: progress_callback("🧠 Generating initial answer using Ground-Level graph...")
         # Initial bottom-level answer

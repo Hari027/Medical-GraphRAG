@@ -5,7 +5,7 @@ import numpy as np
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from scipy.spatial.distance import cosine
 
-from data_models import Entity, Relationship, MetaMedGraph, UMLS_SEMANTIC_TYPES, MEDICAL_TAGS
+from medgraphrag.models import Entity, Relationship, MetaMedGraph, UMLS_SEMANTIC_TYPES, MEDICAL_TAGS
 
 from typing import Any
 
@@ -43,18 +43,58 @@ class EmbeddingStore:
 
 def _call_llm_json(llm: ChatOpenAI, prompt: str) -> dict | list:
     """Call LLM and parse JSON from the response."""
+    print(f"\n[LLM Debug] Invoking LLM with prompt ({len(prompt)} chars)...")
     resp = llm.invoke(prompt)
     raw = resp.content.strip()
-    # strip markdown fences
+    print(f"[LLM Debug] Raw LLM Response:\n{raw}\n{'-'*40}")
+    
+    # Try to find a JSON block inside markdown fences first
+    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
+    if fence_match:
+        block = fence_match.group(1).strip()
+        try:
+            parsed = json.loads(block)
+            print(f"[LLM Debug] Successfully parsed from markdown fence: {type(parsed)}")
+            return parsed
+        except json.JSONDecodeError as e:
+            print(f"[LLM Debug] Fence JSON decode error: {e}")
+            raw = block
+
+    # Strip any leading/trailing fences if still present
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # try to extract first JSON object/array
-        m = re.search(r"(\{.*\}|\[.*\])", raw, re.DOTALL)
-        if m:
-            return json.loads(m.group(1))
+        parsed = json.loads(raw)
+        print(f"[LLM Debug] Successfully parsed full raw string: {type(parsed)}")
+        return parsed
+    except json.JSONDecodeError as e:
+        print(f"[LLM Debug] Full string JSON decode error: {e}. Attempting robust substring extraction...")
+        # Robustly extract the outermost JSON array or object
+        # Look for the first occurrence of '[' or '{'
+        arr_idx = raw.find('[')
+        obj_idx = raw.find('{')
+        
+        if arr_idx != -1 and (obj_idx == -1 or arr_idx < obj_idx):
+            # Array comes first or is the only container
+            m = re.search(r"(\[.*\])", raw, re.DOTALL)
+            if m:
+                try: 
+                    parsed = json.loads(m.group(1))
+                    print(f"[LLM Debug] Successfully extracted array: {type(parsed)}")
+                    return parsed
+                except Exception as ex: 
+                    print(f"[LLM Debug] Substring array parse failed: {ex}")
+        elif obj_idx != -1:
+            # Object comes first
+            m = re.search(r"(\{.*\})", raw, re.DOTALL)
+            if m:
+                try: 
+                    parsed = json.loads(m.group(1))
+                    print(f"[LLM Debug] Successfully extracted object: {type(parsed)}")
+                    return parsed
+                except Exception as ex:
+                    print(f"[LLM Debug] Substring object parse failed: {ex}")
+        print("[LLM Debug] Failed to extract any valid JSON structure. Returning empty dict.")
         return {}
 
 
@@ -75,6 +115,16 @@ def _extract_entities(llm: ChatOpenAI, chunk_text: str) -> list[Entity]:
     """).strip()
     result = _call_llm_json(llm, prompt)
     entities = []
+    if isinstance(result, dict):
+        # Unwrap if LLM returned {"entities": [...]} or similar
+        for v in result.values():
+            if isinstance(v, list):
+                result = v
+                break
+        else:
+            if "name" in result:
+                result = [result]
+
     if isinstance(result, list):
         for item in result:
             if isinstance(item, dict) and "name" in item:
@@ -111,6 +161,15 @@ def _extract_relationships(
     """).strip()
     result = _call_llm_json(llm, prompt)
     rels = []
+    if isinstance(result, dict):
+        for v in result.values():
+            if isinstance(v, list):
+                result = v
+                break
+        else:
+            if "source" in result and "target" in result:
+                result = [result]
+
     if isinstance(result, list):
         for item in result:
             if isinstance(item, dict) and "source" in item and "target" in item:

@@ -2,7 +2,7 @@ from typing import Optional
 import requests
 import numpy as np
 from neo4j import GraphDatabase
-from data_models import Entity, Relationship
+from medgraphrag.models import Entity, Relationship
 
 class UMLSClient:
     """
@@ -341,32 +341,61 @@ class Neo4jClient:
     def get_k_hop_neighbors(self, entity_name: str, k: int) -> list[Entity]:
         """
         Retrieves all entities within k hops of the given entity from Neo4j.
+        Runs a dedicated L3 query to avoid L3 being crowded out by dense L2 paths.
+        Returns a larger candidate pool for semantic re-ranking in the caller.
         """
         if not self.driver: return []
-        entities = []
+        
+        l3_entities = []
+        other_entities = []
+        
         with self.driver.session() as session:
-            # Cypher wildcard for up to k hops regardless of direction and edge type
-            query = f"""
+            # Query 1: Specifically target L3 entities
+            q_l3 = f"""
             MATCH (start:Entity {{name: $name}})-[*1..{k}]-(neighbor:Entity)
+            WHERE neighbor.layer = 3
             RETURN DISTINCT neighbor.name AS name, neighbor.type AS type, 
                    neighbor.context AS context, neighbor.definition AS definition, 
                    neighbor.layer AS layer
             LIMIT 50
             """
             try:
-                result = session.run(query, name=entity_name)
+                result = session.run(q_l3, name=entity_name)
                 for record in result:
-                    e = Entity(
+                    l3_entities.append(Entity(
                         name=record["name"],
                         entity_type=record["type"] or "Medical Concept",
                         context=record["context"] or "",
                         definition=record["definition"] or "",
                         layer=record["layer"] or 3
-                    )
-                    entities.append(e)
+                    ))
             except Exception as e:
-                print(f"Neo4j get_k_hop_neighbors Error: {e}")
-        return entities
+                print(f"Neo4j get_k_hop_neighbors (L3) Error: {e}")
+
+            # Query 2: Non-L3 entities (L1 + L2)
+            q_other = f"""
+            MATCH (start:Entity {{name: $name}})-[*1..{k}]-(neighbor:Entity)
+            WHERE neighbor.layer <> 3
+            RETURN DISTINCT neighbor.name AS name, neighbor.type AS type, 
+                   neighbor.context AS context, neighbor.definition AS definition, 
+                   neighbor.layer AS layer
+            LIMIT 40
+            """
+            try:
+                result = session.run(q_other, name=entity_name)
+                for record in result:
+                    other_entities.append(Entity(
+                        name=record["name"],
+                        entity_type=record["type"] or "Medical Concept",
+                        context=record["context"] or "",
+                        definition=record["definition"] or "",
+                        layer=record["layer"] or 2
+                    ))
+            except Exception as e:
+                print(f"Neo4j get_k_hop_neighbors (L1/L2) Error: {e}")
+
+        # Return all candidates — re-ranking happens in MedGraphRAG.query()
+        return l3_entities + other_entities
 
 class PubMedClient:
     def __init__(self):

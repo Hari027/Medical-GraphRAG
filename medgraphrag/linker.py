@@ -61,7 +61,7 @@ def link_layers_gpu(uri: str, user: str, password: str,
     # Step 2: Embed (or Resume from Disk)
     # ---------------------------------------------------------------
     mmap_file = "l3_embeddings.dat"
-    embedding_dim = 384
+    embedding_dim = 768
     expected_size = l3_total * embedding_dim * 4 # float32
     
     resume_available = False
@@ -72,7 +72,7 @@ def link_layers_gpu(uri: str, user: str, password: str,
             resume_available = True
     
     # Always embed L2 (it's small)
-    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device=device)
+    model = SentenceTransformer("cambridgeltl/SapBERT-from-PubMedBERT-fulltext", device=device)
     l2_embeddings = model.encode(l2_texts, batch_size=embed_batch_size, normalize_embeddings=True, convert_to_numpy=True)
     l2_tensor_full = torch.from_numpy(l2_embeddings).to(torch.float32)
     del l2_embeddings
