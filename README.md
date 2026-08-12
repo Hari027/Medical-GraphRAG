@@ -17,7 +17,6 @@ The system uses a U-Retrieval process:
 2. **Triple-Neighbour Expansion**: Neo4j Cypher traversals gather localized context spanning all three layers (Patient Data + PubMed References + UMLS Definitions).
 3. **Bottom-Up Refinement**: The system iterates over the tag tree, synthesizing specific answers back up into a global, refined summary.
 
-See the [Architecture Diagram](docs/architecture.md) for a detailed visualization.
 
 ## Data Sources
 - **PubMed**: Ingested via NCBI E-utilities for Layer 2. Uses MeSH terms for structured metadata.
@@ -35,8 +34,7 @@ Medical-GraphRAG/
 ├── app/               # Streamlit application UI
 ├── medgraphrag/       # Core GraphRAG pipeline, models, and LLM clients
 ├── ingestion/         # Scripts for PubMed and UMLS data ingestion
-├── tests/             # Benchmarks and tests
-├── docs/              # Documentation and architecture diagrams
+
 ├── screenshots/       # (TODO: Add screenshots of the Streamlit UI)
 ```
 
@@ -85,7 +83,7 @@ streamlit run app/streamlit_app.py
 ```
 
 ## Evaluation / Benchmarking
-Initial local testing with a 31B open-weights model using the MedQA-USMLE dataset demonstrated an 89.3% accuracy rate using this architecture (see `tests/benchmark_results.json` and `docs/CSET431_Literature_Review.txt` for historical test scripts and methodology).
+Initial local testing with a 31B open-weights model using the MedQA-USMLE dataset demonstrated an 89.3% accuracy rate using this architecture.
 
 ## Limitations and Safety
 - **Not Clinically Validated**: This is an educational/research prototype. It is not a clinically validated decision-support system and must not be used for actual medical diagnosis or treatment.

@@ -37,3 +37,8 @@ scratch/
 
 # Datasets
 MedQA-USMLE/
+
+# Ignored Folders (User Requested)
+docs/
+paper/
+tests/
