@@ -70,12 +70,18 @@ Ensure you provide `OPENAI_API_KEY`, `UMLS_API_KEY`, `HUGGINGFACEHUB_API_TOKEN`,
 5. **Neo4j Setup**
 Ensure you have a Neo4j instance running (e.g., Neo4j Desktop or Docker) matching the credentials in your `.env`.
 
-6. **PubMed & UMLS Ingestion**
-To populate Layer 2 and Layer 3, run the ingestion scripts:
+6. **Data Ingestion & Cross-Layer Linking**
+To populate Layer 2 (PubMed) and Layer 3 (UMLS), run the ingestion scripts:
 *(Note: UMLS ingestion requires the raw UMLS `.RRF` data files to be downloaded and placed locally in the repository root folder before running).*
 ```bash
 python ingestion/pubmed.py
 python ingestion/umls.py
+```
+
+7. **Generate Embeddings & Links**
+After the text data is ingested, run the GPU-accelerated linker to compute SapBERT embeddings and create cross-layer semantic edges (`the_definition_of`):
+```bash
+python medgraphrag/linker.py
 ```
 
 ## Running the Application
