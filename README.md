@@ -72,6 +72,7 @@ Ensure you have a Neo4j instance running (e.g., Neo4j Desktop or Docker) matchin
 
 6. **PubMed & UMLS Ingestion**
 To populate Layer 2 and Layer 3, run the ingestion scripts:
+*(Note: UMLS ingestion requires the raw UMLS `.RRF` data files to be downloaded and placed locally in the repository root folder before running).*
 ```bash
 python ingestion/pubmed.py
 python ingestion/umls.py
